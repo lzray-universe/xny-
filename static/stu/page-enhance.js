@@ -751,7 +751,9 @@
   const markdownUploadedNames = new Map();
   const markdownPlainTextMode = new Map();
   const markdownPlainTextRenders = new Map();
+  const markdownRenderCache = new Map();
   const markdownBlobDownloadUrls = new Map();
+  const handwritePatchedVms = new WeakSet();
   const PLAIN_TEXT_MAX_DENSITY = 30;
   let markdownRenderTimer = 0;
 
@@ -921,15 +923,21 @@
     markdownPlainTextRenders.delete(String(questionKey || ""));
   };
 
-  const buildPlainTextImageFilename = (value) => {
-    const source = normalizePlainTextSource(value).trim();
+  const buildAnswerHash = (value) => {
+    const source = String(value || "");
     let hash = 2166136261;
     for (let index = 0; index < source.length; index += 1) {
       hash ^= source.charCodeAt(index);
       hash = Math.imul(hash, 16777619);
     }
-    return `plain-answer-${(hash >>> 0).toString(16).padStart(8, "0")}.png`;
+    return (hash >>> 0).toString(16).padStart(8, "0");
   };
+
+  const buildPlainTextImageFilename = (value) =>
+    `plain-answer-${buildAnswerHash(normalizePlainTextSource(value).trim())}.png`;
+
+  const buildMarkdownImageFilename = (value) =>
+    `md-answer-${buildAnswerHash(normalizePlainTextSource(value).trim())}.png`;
 
   const clearMarkdownBlobDownloadUrl = (questionKey) => {
     const key = String(questionKey || "");
@@ -994,11 +1002,320 @@
     return canvasToBlob(canvas);
   };
 
+  const wait = (delay) =>
+    new Promise((resolve) => {
+      window.setTimeout(resolve, delay);
+    });
+
+  const loadImageFromBlob = (blob) =>
+    new Promise((resolve, reject) => {
+      const objectUrl = window.URL.createObjectURL(blob);
+      const image = new Image();
+      image.onload = () => {
+        window.URL.revokeObjectURL(objectUrl);
+        resolve(image);
+      };
+      image.onerror = () => {
+        window.URL.revokeObjectURL(objectUrl);
+        reject(new Error("图片加载失败。"));
+      };
+      image.src = objectUrl;
+    });
+
+  const cropImageBlobWhitespace = async (blob, options = {}) => {
+    if (!blob) {
+      throw new Error("没有可裁剪的图片。");
+    }
+
+    const image = await loadImageFromBlob(blob);
+    const sourceCanvas = document.createElement("canvas");
+    sourceCanvas.width = image.naturalWidth || image.width;
+    sourceCanvas.height = image.naturalHeight || image.height;
+    const sourceContext = sourceCanvas.getContext("2d", { willReadFrequently: true });
+    if (!sourceContext) {
+      return blob;
+    }
+
+    sourceContext.drawImage(image, 0, 0);
+    const { data, width, height } = sourceContext.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
+    const threshold = Number(options.threshold || 248);
+    const paddingX = Number(options.paddingX || 28);
+    const paddingY = Number(options.paddingY || 24);
+    const minWidth = Number(options.minWidth || 320);
+    const minHeight = Number(options.minHeight || 120);
+
+    let minX = width;
+    let minY = height;
+    let maxX = -1;
+    let maxY = -1;
+
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const offset = (y * width + x) * 4;
+        const alpha = data[offset + 3];
+        if (alpha < 16) {
+          continue;
+        }
+
+        const red = data[offset];
+        const green = data[offset + 1];
+        const blue = data[offset + 2];
+        const isNearWhite = red >= threshold && green >= threshold && blue >= threshold;
+        if (isNearWhite) {
+          continue;
+        }
+
+        if (x < minX) {
+          minX = x;
+        }
+        if (y < minY) {
+          minY = y;
+        }
+        if (x > maxX) {
+          maxX = x;
+        }
+        if (y > maxY) {
+          maxY = y;
+        }
+      }
+    }
+
+    if (maxX < 0 || maxY < 0) {
+      return blob;
+    }
+
+    minX = Math.max(0, minX - paddingX);
+    minY = Math.max(0, minY - paddingY);
+    maxX = Math.min(width - 1, maxX + paddingX);
+    maxY = Math.min(height - 1, maxY + paddingY);
+
+    let cropWidth = maxX - minX + 1;
+    let cropHeight = maxY - minY + 1;
+
+    if (cropWidth < minWidth) {
+      const extra = Math.ceil((minWidth - cropWidth) / 2);
+      minX = Math.max(0, minX - extra);
+      maxX = Math.min(width - 1, maxX + extra);
+      cropWidth = maxX - minX + 1;
+    }
+
+    if (cropHeight < minHeight) {
+      const extra = Math.ceil((minHeight - cropHeight) / 2);
+      minY = Math.max(0, minY - extra);
+      maxY = Math.min(height - 1, maxY + extra);
+      cropHeight = maxY - minY + 1;
+    }
+
+    if (cropWidth >= width && cropHeight >= height) {
+      return blob;
+    }
+
+    const targetCanvas = document.createElement("canvas");
+    targetCanvas.width = cropWidth;
+    targetCanvas.height = cropHeight;
+    const targetContext = targetCanvas.getContext("2d");
+    if (!targetContext) {
+      return blob;
+    }
+
+    targetContext.fillStyle = "#ffffff";
+    targetContext.fillRect(0, 0, cropWidth, cropHeight);
+    targetContext.drawImage(
+      sourceCanvas,
+      minX,
+      minY,
+      cropWidth,
+      cropHeight,
+      0,
+      0,
+      cropWidth,
+      cropHeight
+    );
+
+    const croppedBlob = await canvasToBlob(targetCanvas);
+    return croppedBlob || blob;
+  };
+
+  const getMarkdownRenderer = (() => {
+    let instance = null;
+    return () => {
+      if (instance) {
+        return instance;
+      }
+      if (typeof window.markdownit !== "function") {
+        throw new Error("Markdown 渲染器未加载。");
+      }
+
+      instance = window.markdownit({
+        html: false,
+        breaks: true,
+        linkify: true,
+        typographer: false
+      });
+
+      const nativeLinkOpen =
+        instance.renderer.rules.link_open ||
+        ((tokens, idx, options, env, self) => self.renderToken(tokens, idx, options));
+      instance.renderer.rules.link_open = (tokens, idx, options, env, self) => {
+        tokens[idx].attrSet("target", "_blank");
+        tokens[idx].attrSet("rel", "noreferrer noopener");
+        return nativeLinkOpen(tokens, idx, options, env, self);
+      };
+      return instance;
+    };
+  })();
+
+  const ensureMathTypesetterReady = async () => {
+    if (!window.MathJax) {
+      throw new Error("公式渲染器未加载。");
+    }
+    if (window.MathJax.startup && window.MathJax.startup.promise) {
+      await window.MathJax.startup.promise;
+    }
+    if (typeof window.MathJax.typesetPromise !== "function") {
+      throw new Error("公式渲染器初始化失败。");
+    }
+  };
+
+  const waitForImagesReady = async (root) => {
+    const images = [...root.querySelectorAll("img")];
+    await Promise.all(
+      images.map(
+        (image) =>
+          new Promise((resolve) => {
+            let settled = false;
+            const finish = () => {
+              if (settled) {
+                return;
+              }
+              settled = true;
+              resolve();
+            };
+
+            const rawSrc = image.getAttribute("src") || "";
+            if (rawSrc) {
+              try {
+                image.src = new URL(rawSrc, window.location.origin).toString();
+              } catch (error) {
+                // Ignore malformed URLs and let the existing src continue.
+              }
+            }
+
+            if (image.complete) {
+              finish();
+              return;
+            }
+
+            image.addEventListener("load", finish, { once: true });
+            image.addEventListener("error", finish, { once: true });
+            window.setTimeout(finish, 2500);
+          })
+      )
+    );
+  };
+
+  const rememberMarkdownRenderBlob = (cacheKey, sourceText, blob) => {
+    markdownRenderCache.set(cacheKey, {
+      sourceText,
+      blob
+    });
+    if (markdownRenderCache.size <= 24) {
+      return;
+    }
+    const oldestKey = markdownRenderCache.keys().next().value;
+    if (oldestKey) {
+      markdownRenderCache.delete(oldestKey);
+    }
+  };
+
+  const renderMarkdownToImageBlob = async (markdownText) => {
+    const normalized = normalizePlainTextSource(markdownText).trim();
+    if (!normalized) {
+      throw new Error("Markdown 内容为空。");
+    }
+    if (!window.htmlToImage || typeof window.htmlToImage.toBlob !== "function") {
+      throw new Error("图片渲染器未加载。");
+    }
+
+    const cacheKey = buildAnswerHash(normalized);
+    const cached = markdownRenderCache.get(cacheKey);
+    if (cached && cached.sourceText === normalized && cached.blob) {
+      return {
+        blob: cached.blob,
+        filename: buildMarkdownImageFilename(normalized),
+        cacheHit: true
+      };
+    }
+
+    const renderer = getMarkdownRenderer();
+    await ensureMathTypesetterReady();
+
+    const host = document.createElement("div");
+    host.className = "page-md-render-capture-host";
+    host.innerHTML = `
+      <article class="page-md-render-capture">
+        <div class="page-md-render-capture__body"></div>
+      </article>
+    `;
+
+    const article = host.firstElementChild;
+    const body = article && article.querySelector(".page-md-render-capture__body");
+    if (!article || !body) {
+      throw new Error("创建 Markdown 渲染容器失败。");
+    }
+
+    body.innerHTML = renderer.render(normalized);
+    document.body.appendChild(host);
+
+    try {
+      await waitForImagesReady(body);
+
+      if (typeof window.MathJax.typesetClear === "function") {
+        window.MathJax.typesetClear([body]);
+      }
+      await window.MathJax.typesetPromise([body]);
+
+      if (document.fonts && document.fonts.ready) {
+        try {
+          await document.fonts.ready;
+        } catch (error) {
+          // Continue even if font readiness cannot be determined.
+        }
+      }
+
+      await wait(40);
+
+      const blob = await window.htmlToImage.toBlob(article, {
+        backgroundColor: "#ffffff",
+        pixelRatio: Math.max(2, Math.min(3, Math.ceil(window.devicePixelRatio || 1))),
+        cacheBust: true
+      });
+      if (!blob) {
+        throw new Error("前端 Markdown 图片生成失败。");
+      }
+
+      const croppedBlob = await cropImageBlobWhitespace(blob, {
+        threshold: 250,
+        paddingX: 22,
+        paddingY: 24,
+        minWidth: 320,
+        minHeight: 140
+      });
+
+      rememberMarkdownRenderBlob(cacheKey, normalized, croppedBlob);
+      return {
+        blob: croppedBlob,
+        filename: buildMarkdownImageFilename(normalized),
+        cacheHit: false
+      };
+    } finally {
+      host.remove();
+    }
+  };
+
   const getMarkdownAttachments = (vm) => {
     const list = Array.isArray(vm && vm.subjectiveQuesData) ? vm.subjectiveQuesData : [];
-    return list.filter(
-      (item) => item && Number(item.questionAttachmentType) === 5 && Number(item.extraTag || 0) === 0
-    );
+    return list.filter((item) => item && Number(item.questionAttachmentType) === 5);
   };
 
   const getMarkdownAttachmentCount = (vm) => {
@@ -1114,6 +1431,40 @@
     };
   };
 
+  const requestServerRenderedMarkdown = async (context, markdownText) => {
+    const response = await fetch("/exam/api/markdown-answer", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        entityType: context.entityType,
+        entityId: context.entityId,
+        questionId: context.questionId,
+        questionNumber: context.questionNumber,
+        markdown: markdownText
+      })
+    });
+
+    const result = await readApiResponse(response);
+    const payload = result.payload || {};
+    if (!response.ok || !isSuccessfulApiPayload(payload)) {
+      throw new Error(payload.message || result.rawText || `生成失败 (${response.status})`);
+    }
+
+    const extra = payload && payload.extra ? payload.extra : {};
+    const downloadUrl = extra.downloadUrl || "";
+    if (!downloadUrl) {
+      throw new Error("Markdown 图片已生成，但没有返回下载地址。");
+    }
+
+    return {
+      downloadUrl,
+      filename: extra.filename || buildMarkdownImageFilename(markdownText),
+      cacheText: extra.cacheHit ? "命中服务端缓存" : "服务端新生成"
+    };
+  };
+
   const uploadGeneratedMarkdownImage = async (vm, context, downloadUrl, filename) => {
     if (!downloadUrl) {
       return {
@@ -1151,6 +1502,335 @@
     } else if (typeof vm.$emit === "function") {
       vm.$emit("getStuAnaswerInfo", context.entityId);
     }
+  };
+
+  const notifyVm = (vm, tone, message) => {
+    if (!message) {
+      return;
+    }
+    try {
+      if (tone === "error" && vm && typeof vm.$error === "function") {
+        vm.$error({
+          title: "错误",
+          content: message
+        });
+        return;
+      }
+
+      const api =
+        vm && vm.$message && typeof vm.$message === "object"
+          ? vm.$message
+          : null;
+      const method =
+        tone === "error"
+          ? "error"
+          : tone === "success"
+            ? "success"
+            : "warning";
+      if (api && typeof api[method] === "function") {
+        api[method](message);
+        return;
+      }
+    } catch (error) {
+      // Fall through to alert.
+    }
+
+    window.alert(message);
+  };
+
+  const getHandwriteOverlay = () => document.getElementById("page-handwrite-overlay");
+
+  const closeHandwriteModal = () => {
+    const overlay = getHandwriteOverlay();
+    if (!overlay) {
+      return;
+    }
+    if (typeof overlay.__onResize === "function") {
+      window.removeEventListener("resize", overlay.__onResize);
+    }
+    if (typeof overlay.__onKeyDown === "function") {
+      window.removeEventListener("keydown", overlay.__onKeyDown, true);
+    }
+    overlay.remove();
+  };
+
+  const setHandwriteModalStatus = (overlay, message, tone = "") => {
+    const status = overlay && overlay.querySelector(".page-handwrite-modal__status");
+    if (!status) {
+      return;
+    }
+    status.textContent = message || "";
+    status.dataset.tone = tone || "";
+  };
+
+  const HANDWRITE_BRUSH_PRESETS = {
+    fine: {
+      minWidth: 0.7,
+      maxWidth: 1.7
+    },
+    medium: {
+      minWidth: 1.1,
+      maxWidth: 2.7
+    },
+    bold: {
+      minWidth: 1.8,
+      maxWidth: 4.1
+    }
+  };
+
+  const syncHandwriteBrushButtons = (overlay, activeBrush) => {
+    overlay.querySelectorAll("[data-handwrite-brush]").forEach((button) => {
+      button.classList.toggle("is-active", button.dataset.handwriteBrush === activeBrush);
+    });
+  };
+
+  const applyHandwriteBrushPreset = (signaturePad, overlay, brushKey) => {
+    const preset = HANDWRITE_BRUSH_PRESETS[brushKey] || HANDWRITE_BRUSH_PRESETS.medium;
+    signaturePad.minWidth = preset.minWidth;
+    signaturePad.maxWidth = preset.maxWidth;
+    overlay.dataset.brush = brushKey;
+    syncHandwriteBrushButtons(overlay, brushKey);
+  };
+
+  const resizeSignatureCanvas = (canvas, signaturePad) => {
+    if (!canvas || !signaturePad) {
+      return;
+    }
+    const bounds = canvas.getBoundingClientRect();
+    if (!bounds.width || !bounds.height) {
+      return;
+    }
+
+    const ratio = Math.max(window.devicePixelRatio || 1, 1);
+    const data = signaturePad.toData();
+    canvas.width = Math.round(bounds.width * ratio);
+    canvas.height = Math.round(bounds.height * ratio);
+
+    const context2d = canvas.getContext("2d");
+    if (!context2d) {
+      return;
+    }
+
+    context2d.scale(ratio, ratio);
+    signaturePad.clear();
+    if (data.length) {
+      signaturePad.fromData(data);
+    }
+  };
+
+  const exportHandwritePaperBlob = async (paperNode) => {
+    if (!paperNode) {
+      throw new Error("手写纸张不存在。");
+    }
+    if (!window.htmlToImage || typeof window.htmlToImage.toBlob !== "function") {
+      throw new Error("图片渲染器未加载。");
+    }
+
+    if (document.fonts && document.fonts.ready) {
+      try {
+        await document.fonts.ready;
+      } catch (error) {
+        // Continue even if font readiness cannot be determined.
+      }
+    }
+
+    await wait(20);
+
+    const blob = await window.htmlToImage.toBlob(paperNode, {
+      backgroundColor: "#ffffff",
+      pixelRatio: Math.max(2, Math.min(3, Math.ceil(window.devicePixelRatio || 1))),
+      cacheBust: true
+    });
+    if (!blob) {
+      throw new Error("手写图片导出失败。");
+    }
+    return blob;
+  };
+
+  const buildHandwriteImageFilename = (context) =>
+    `handwrite-${context.questionId}-${Date.now()}.png`;
+
+  const openEnhancedHandwriteModal = (vm, context) => {
+    if (!context) {
+      throw new Error("无法识别当前题目。");
+    }
+    if (typeof window.SignaturePad !== "function") {
+      throw new Error("手写库未加载。");
+    }
+    if (getMarkdownAttachmentCount(vm) >= 3) {
+      notifyVm(vm, "warning", "只能添加三张图片，请删除后再添加。");
+      return;
+    }
+
+    closeHandwriteModal();
+
+    const overlay = document.createElement("div");
+    overlay.id = "page-handwrite-overlay";
+    overlay.className = "page-handwrite-modal";
+    overlay.innerHTML = `
+      <div class="page-handwrite-modal__card">
+        <div class="page-handwrite-modal__head">
+          <div>
+            <div class="page-handwrite-modal__eyebrow">Signature Pad</div>
+            <div class="page-handwrite-modal__title">手写作答</div>
+            <div class="page-handwrite-modal__meta">题号 ${context.questionNumber} · 平滑笔迹 · 直接按图片方式上传</div>
+          </div>
+          <button type="button" class="page-handwrite-modal__close">关闭</button>
+        </div>
+        <div class="page-handwrite-modal__toolbar">
+          <div class="page-handwrite-toolbar__group">
+            <button type="button" class="page-handwrite-tool" data-handwrite-brush="fine">细</button>
+            <button type="button" class="page-handwrite-tool is-active" data-handwrite-brush="medium">中</button>
+            <button type="button" class="page-handwrite-tool" data-handwrite-brush="bold">粗</button>
+          </div>
+          <div class="page-handwrite-toolbar__group">
+            <button type="button" class="page-handwrite-tool" data-handwrite-action="undo">撤销</button>
+            <button type="button" class="page-handwrite-tool" data-handwrite-action="clear">清空</button>
+          </div>
+        </div>
+        <div class="page-handwrite-modal__stage">
+          <div class="page-handwrite-paper">
+            <div class="page-handwrite-paper__head">
+              <span>新能源课程手写作答</span>
+              <span>Q${context.questionNumber}</span>
+            </div>
+            <canvas class="page-handwrite-paper__canvas"></canvas>
+          </div>
+        </div>
+        <div class="page-handwrite-modal__footer">
+          <div class="page-handwrite-modal__status"></div>
+          <div class="page-handwrite-modal__actions">
+            <button type="button" class="page-handwrite-secondary" data-handwrite-action="cancel">取消</button>
+            <button type="button" class="page-handwrite-primary" data-handwrite-action="save">上传作答</button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(overlay);
+
+    const paper = overlay.querySelector(".page-handwrite-paper");
+    const canvas = overlay.querySelector(".page-handwrite-paper__canvas");
+    const saveButton = overlay.querySelector('[data-handwrite-action="save"]');
+    if (!paper || !canvas || !saveButton) {
+      overlay.remove();
+      throw new Error("手写面板初始化失败。");
+    }
+
+    const signaturePad = new window.SignaturePad(canvas, {
+      penColor: "#0f172a",
+      minDistance: 0.6,
+      throttle: 8,
+      velocityFilterWeight: 0.72
+    });
+
+    const onResize = () => resizeSignatureCanvas(canvas, signaturePad);
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeHandwriteModal();
+      }
+    };
+
+    overlay.__onResize = onResize;
+    overlay.__onKeyDown = onKeyDown;
+    window.addEventListener("resize", onResize);
+    window.addEventListener("keydown", onKeyDown, true);
+
+    applyHandwriteBrushPreset(signaturePad, overlay, "medium");
+    window.requestAnimationFrame(onResize);
+
+    overlay.addEventListener("click", (event) => {
+      if (event.target === overlay) {
+        closeHandwriteModal();
+      }
+    });
+
+    overlay.querySelector(".page-handwrite-modal__close").addEventListener("click", closeHandwriteModal);
+
+    overlay.querySelectorAll("[data-handwrite-brush]").forEach((button) => {
+      button.addEventListener("click", () => {
+        applyHandwriteBrushPreset(signaturePad, overlay, button.dataset.handwriteBrush || "medium");
+      });
+    });
+
+    overlay.querySelector('[data-handwrite-action="undo"]').addEventListener("click", () => {
+      const data = signaturePad.toData();
+      if (!data.length) {
+        setHandwriteModalStatus(overlay, "当前没有可撤销的笔迹。");
+        return;
+      }
+      data.pop();
+      signaturePad.clear();
+      if (data.length) {
+        signaturePad.fromData(data);
+      }
+      if (!data.length) {
+        signaturePad.clear();
+      }
+      setHandwriteModalStatus(overlay, "已撤销上一笔。");
+    });
+
+    overlay.querySelector('[data-handwrite-action="clear"]').addEventListener("click", () => {
+      signaturePad.clear();
+      setHandwriteModalStatus(overlay, "画布已清空。");
+    });
+
+    overlay.querySelector('[data-handwrite-action="cancel"]').addEventListener("click", closeHandwriteModal);
+
+    saveButton.addEventListener("click", async () => {
+      if (overlay.classList.contains("is-busy")) {
+        return;
+      }
+      if (signaturePad.isEmpty()) {
+        setHandwriteModalStatus(overlay, "请先写点内容再上传。", "error");
+        return;
+      }
+
+      overlay.classList.add("is-busy");
+      saveButton.disabled = true;
+      setHandwriteModalStatus(overlay, "正在导出并上传手写作答...", "pending");
+
+      try {
+        const blob = await exportHandwritePaperBlob(paper);
+        const uploadInfo = await uploadMarkdownBlob(vm, context, blob, buildHandwriteImageFilename(context));
+        const statusTone = uploadInfo.success ? "success" : "pending";
+        setHandwriteModalStatus(overlay, uploadInfo.message, statusTone);
+        if (uploadInfo.success) {
+          notifyVm(vm, "success", "手写作答已上传。");
+          closeHandwriteModal();
+        }
+      } catch (error) {
+        setHandwriteModalStatus(
+          overlay,
+          error && error.message ? error.message : "手写作答上传失败。",
+          "error"
+        );
+      } finally {
+        overlay.classList.remove("is-busy");
+        saveButton.disabled = false;
+      }
+    });
+  };
+
+  const patchHandwriteAction = (vm, context) => {
+    if (!vm || typeof vm.openWriteModal !== "function" || handwritePatchedVms.has(vm)) {
+      return;
+    }
+
+    const originalOpenWriteModal = vm.openWriteModal.bind(vm);
+    vm.openWriteModal = (...args) => {
+      const latestContext = getQuestionContext(vm) || context;
+      try {
+        openEnhancedHandwriteModal(vm, latestContext);
+      } catch (error) {
+        console.warn("enhanced handwrite modal fallback", error);
+        return originalOpenWriteModal(...args);
+      }
+      return undefined;
+    };
+
+    handwritePatchedVms.add(vm);
   };
 
   const scheduleMarkdownAnswerRender = (delay = 80) => {
@@ -1230,7 +1910,7 @@
     if (modeHint) {
       modeHint.textContent = plainModeEnabled
         ? "纯文本直渲染：仅当前页面显示，每行最多 30 字密度，不上传后端。"
-        : "图片模式：支持 Markdown / KaTeX，生成后可下载，并继续按图片方式上传。";
+        : "图片模式：前端本地渲染 Markdown / LaTeX 公式，生成后可下载，并继续按图片方式上传。";
     }
     if (plainModeEnabled) {
       setMarkdownDownloadState(panel, "", "");
@@ -1462,40 +2142,36 @@
         clearPlainTextRender(context.key);
         clearMarkdownBlobDownloadUrl(context.key);
         ensurePlainTextRender(host, context);
-        const response = await fetch("/exam/api/markdown-answer", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            entityType: context.entityType,
-            entityId: context.entityId,
-            questionId: context.questionId,
-            questionNumber: context.questionNumber,
-            markdown: markdownText
-          })
-        });
+        let localRender = null;
+        try {
+          localRender = await renderMarkdownToImageBlob(markdownText);
+        } catch (renderError) {
+          const serverRender = await requestServerRenderedMarkdown(context, markdownText);
+          downloadUrl = serverRender.downloadUrl;
+          filename = serverRender.filename;
+          cacheText = serverRender.cacheText;
+          setMarkdownDownloadState(panel, downloadUrl, filename);
+          setMarkdownPanelBusy(panel, true, { keepDownloadEnabled: true });
+          setMarkdownPanelStatus(panel, `${cacheText}，可直接下载图片，正在按图片方式上传...`, "pending");
 
-        const result = await readApiResponse(response);
-        const payload = result.payload || {};
-        if (!response.ok || !isSuccessfulApiPayload(payload)) {
-          throw new Error(payload.message || result.rawText || `生成失败 (${response.status})`);
+          const uploadInfo = await uploadGeneratedMarkdownImage(vm, context, downloadUrl, filename);
+          const statusTone = uploadInfo.success ? "success" : "pending";
+          setMarkdownPanelStatus(panel, `${cacheText}，${uploadInfo.message} 可直接下载图片。`, statusTone);
+          return;
         }
 
-        const extra = payload && payload.extra ? payload.extra : {};
-        downloadUrl = extra.downloadUrl || "";
-        filename = extra.filename || "";
-        cacheText = extra.cacheHit ? "命中缓存" : "新生成";
-
-        if (!downloadUrl) {
-          throw new Error("Markdown 图片已生成，但没有返回下载地址。");
-        }
+        filename = localRender.filename;
+        cacheText = localRender.cacheHit ? "命中前端缓存" : "前端新渲染";
+        downloadUrl = rememberMarkdownBlobDownloadUrl(
+          context.key,
+          window.URL.createObjectURL(localRender.blob)
+        );
 
         setMarkdownDownloadState(panel, downloadUrl, filename);
         setMarkdownPanelBusy(panel, true, { keepDownloadEnabled: true });
         setMarkdownPanelStatus(panel, `${cacheText}，可直接下载图片，正在按图片方式上传...`, "pending");
 
-        const uploadInfo = await uploadGeneratedMarkdownImage(vm, context, downloadUrl, filename);
+        const uploadInfo = await uploadMarkdownBlob(vm, context, localRender.blob, filename);
         const statusTone = uploadInfo.success ? "success" : "pending";
         setMarkdownPanelStatus(panel, `${cacheText}，${uploadInfo.message} 可直接下载图片。`, statusTone);
       } catch (error) {
@@ -1606,12 +2282,14 @@
         return;
       }
 
+      patchHandwriteAction(vm, context);
       ensureMarkdownButton(host, vm, context);
       ensurePlainTextRender(host, context);
     });
   }
 
   window.addEventListener("beforeunload", () => {
+    closeHandwriteModal();
     markdownBlobDownloadUrls.forEach((objectUrl) => {
       window.URL.revokeObjectURL(objectUrl);
     });
@@ -1619,10 +2297,12 @@
   });
 
   window.addEventListener("hashchange", () => {
+    closeHandwriteModal();
     pulseRoute();
     scheduleCourseRepair(120);
   });
   window.addEventListener("pageshow", () => {
+    closeHandwriteModal();
     pulseRoute();
     scheduleCourseRepair(120);
   });

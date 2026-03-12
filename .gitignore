@@ -5,3 +5,5 @@
 /test.py
 /.idea
 /exam/jyhr/*
+__pycache__/
+*.pyc

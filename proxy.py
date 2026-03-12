@@ -37,6 +37,7 @@ STREAM_CHUNK_SIZE = 64 * 1024
 app = Flask(__name__)
 ATTACHMENT_KEY = os.environ.get('ATTACHMENT_AES_KEY', '348ebfa6d1f9708310cb8a7f88367bc5').encode('utf-8')
 ATTACHMENT_PATH_RE = re.compile(r'^[A-Za-z0-9+/=]+$')
+ENHANCE_ASSET_VERSION = '20260312-speedup2'
 
 PDF_HTML_STYLE = """<style>
 img { max-width: 100%; height: auto; }
@@ -1569,9 +1570,14 @@ def _stu_index_with_passive():
         body = resp.get_data(as_text=True)
         inj = ''.join([
             '<script>window.PASSIVE={passive:true};document.documentElement.classList.add(\'page-shell\');</script>',
-            '<link rel="preload" href="/stu/page-enhance.css?v=20260312md5" as="style">',
-            '<link rel="stylesheet" href="/stu/page-enhance.css?v=20260312md5">',
-            '<script defer src="/stu/page-enhance.js?v=20260312md5"></script>',
+            '<script>window.MathJax={startup:{typeset:false},svg:{fontCache:"local"},tex:{inlineMath:[["$","$"],["\\\\(","\\\\)"]],displayMath:[["$$","$$"],["\\\\[","\\\\]"]],processEscapes:true},options:{skipHtmlTags:["script","noscript","style","textarea","pre","code"]}};</script>',
+            f'<link rel="preload" href="/stu/page-enhance.css?v={ENHANCE_ASSET_VERSION}" as="style">',
+            f'<link rel="stylesheet" href="/stu/page-enhance.css?v={ENHANCE_ASSET_VERSION}">',
+            f'<script defer src="/stu/vendor/markdown-it.min.js?v={ENHANCE_ASSET_VERSION}"></script>',
+            f'<script defer src="/stu/vendor/html-to-image.js?v={ENHANCE_ASSET_VERSION}"></script>',
+            f'<script defer src="/stu/vendor/signature_pad.umd.min.js?v={ENHANCE_ASSET_VERSION}"></script>',
+            f'<script defer src="/stu/vendor/tex-svg.js?v={ENHANCE_ASSET_VERSION}"></script>',
+            f'<script defer src="/stu/page-enhance.js?v={ENHANCE_ASSET_VERSION}"></script>',
         ])
         if '</head>' in body:
             body = body.replace('</head>', inj + '</head>', 1)

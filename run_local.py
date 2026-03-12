@@ -13,4 +13,10 @@ os.environ.setdefault(
 
 import proxy
 
-proxy.app.run(host='127.0.0.1', port=18080, debug=False)
+port = 18080
+if len(sys.argv) > 1:
+    port = int(sys.argv[1])
+else:
+    port = int(os.environ.get('PORT', '18080'))
+
+proxy.app.run(host='127.0.0.1', port=port, debug=False)
