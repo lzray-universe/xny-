@@ -3,9 +3,13 @@ import re
 import string
 import random
 import base64
+import hashlib
+import shutil
 import io
 import zipfile
 import threading
+import atexit
+import queue
 from bs4 import BeautifulSoup
 import requests
 from requests.adapters import HTTPAdapter
@@ -16,9 +20,11 @@ import pdfkit
 import aiohttp
 import asyncio
 import tempfile
+import markdown
 from urllib import parse
 from urllib import parse as _parse
 from Crypto.Cipher import AES
+from playwright.sync_api import sync_playwright
 from flask import Flask, request, Response, redirect, send_from_directory, make_response, jsonify
 
 TARGET_URL = os.environ.get('TARGET_URL', 'https://bdfz.xnykcxt.com:5002')
@@ -75,12 +81,306 @@ def resolve_wkhtmltopdf_path():
 WKHTMLTOPDF_BIN = resolve_wkhtmltopdf_path()
 
 
+def resolve_playwright_chromium_path():
+    explicit = os.environ.get('PLAYWRIGHT_CHROMIUM_PATH', '').strip()
+    candidates = []
+    if explicit:
+        candidates.append(explicit)
+    candidates.extend([
+        shutil.which('chromium'),
+        shutil.which('chromium-browser'),
+        shutil.which('google-chrome'),
+        '/usr/bin/chromium',
+        '/usr/bin/chromium-browser',
+        '/usr/bin/google-chrome',
+        r'C:\Program Files\Google\Chrome\Application\chrome.exe',
+        r'C:\Program Files\Chromium\Application\chrome.exe',
+    ])
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return explicit or '/usr/bin/chromium'
+
+
+PLAYWRIGHT_CHROMIUM_BIN = resolve_playwright_chromium_path()
+PLAYWRIGHT_RENDER_LOCK = threading.Lock()
+PLAYWRIGHT_WORKER_LOCK = threading.Lock()
+MARKDOWN_CACHE_LOCK = threading.Lock()
+MARKDOWN_MAX_LENGTH = int(os.environ.get('MARKDOWN_MAX_LENGTH', '20000'))
+MARKDOWN_CACHE_DIR = os.path.join(tempfile.gettempdir(), 'xny_markdown_answer_cache')
+MARKDOWN_CACHE_KEY_RE = re.compile(r'^[a-f0-9]{64}$')
+PLAYWRIGHT_RENDER_QUEUE = None
+PLAYWRIGHT_RENDER_THREAD = None
+PLAYWRIGHT_RENDER_STOP = object()
+PLAYWRIGHT_RENDER_TIMEOUT = int(os.environ.get('PLAYWRIGHT_RENDER_TIMEOUT', str(max(REQUEST_TIMEOUT, 60))))
+MARKDOWN_CAPTURE_STYLE = """<style>
+html, body {
+  margin: 0;
+  padding: 0;
+  background: #ffffff;
+}
+body {
+  color: #0f172a;
+  font-family: "Noto Sans CJK", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  background: #ffffff;
+}
+#capture {
+  display: inline-block;
+  max-width: 860px;
+  padding: 22px 24px;
+  box-sizing: border-box;
+  background: #ffffff;
+}
+#capture,
+#capture * {
+  box-sizing: border-box;
+}
+#capture :first-child {
+  margin-top: 0 !important;
+}
+#capture :last-child {
+  margin-bottom: 0 !important;
+}
+#capture h1,
+#capture h2,
+#capture h3,
+#capture h4,
+#capture h5,
+#capture h6 {
+  margin: 0.25em 0 0.55em;
+  color: #0b1220;
+  font-weight: 700;
+  line-height: 1.28;
+}
+#capture h1 { font-size: 2rem; }
+#capture h2 { font-size: 1.7rem; }
+#capture h3 { font-size: 1.42rem; }
+#capture p,
+#capture li,
+#capture td,
+#capture th,
+#capture blockquote {
+  font-size: 1.06rem;
+  line-height: 1.82;
+}
+#capture p,
+#capture ul,
+#capture ol,
+#capture blockquote,
+#capture pre,
+#capture table {
+  margin: 0 0 0.9em;
+}
+#capture ul,
+#capture ol {
+  padding-left: 1.4em;
+}
+#capture a {
+  color: #0d9488;
+  text-decoration: none;
+}
+#capture strong {
+  color: #08111f;
+}
+#capture img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0.45em 0;
+  border-radius: 14px;
+}
+#capture code {
+  padding: 0.12em 0.38em;
+  border-radius: 8px;
+  background: rgba(148, 163, 184, 0.16);
+  color: #0f172a;
+  font-family: "JetBrains Mono", "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.94em;
+}
+#capture pre {
+  overflow: auto;
+  padding: 0.95em 1.05em;
+  border-radius: 18px;
+  background: rgba(241, 245, 249, 0.96);
+}
+#capture pre code {
+  padding: 0;
+  background: transparent;
+}
+#capture blockquote {
+  padding: 0.15em 0 0.15em 1em;
+  border-left: 4px solid rgba(13, 148, 136, 0.42);
+  color: #334155;
+}
+#capture hr {
+  margin: 1.1em 0;
+  border: 0;
+  border-top: 1px solid rgba(148, 163, 184, 0.34);
+}
+#capture table {
+  width: 100%;
+  border-collapse: collapse;
+  overflow: hidden;
+  border-radius: 14px;
+}
+#capture th,
+#capture td {
+  padding: 0.56em 0.72em;
+  border: 1px solid rgba(148, 163, 184, 0.26);
+  text-align: left;
+  vertical-align: top;
+}
+#capture thead th {
+  background: rgba(13, 148, 136, 0.1);
+}
+#capture .katex-display {
+  margin: 0.9em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.1em 0.02em;
+}
+</style>"""
+
+
+class MarkdownRenderJob:
+    def __init__(self, document):
+        self.document = document
+        self.event = threading.Event()
+        self.result = None
+        self.error = None
+
+
+def close_markdown_browser():
+    global PLAYWRIGHT_RENDER_QUEUE, PLAYWRIGHT_RENDER_THREAD
+
+    with PLAYWRIGHT_WORKER_LOCK:
+        task_queue = PLAYWRIGHT_RENDER_QUEUE
+        worker = PLAYWRIGHT_RENDER_THREAD
+        PLAYWRIGHT_RENDER_QUEUE = None
+        PLAYWRIGHT_RENDER_THREAD = None
+
+    if task_queue is not None:
+        try:
+            task_queue.put_nowait(PLAYWRIGHT_RENDER_STOP)
+        except Exception:
+            pass
+
+    if worker is not None and worker.is_alive():
+        try:
+            worker.join(timeout=2)
+        except Exception:
+            pass
+
+
+def markdown_render_worker(task_queue):
+    playwright = None
+    browser = None
+
+    def close_runtime():
+        nonlocal playwright, browser
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+            browser = None
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+            playwright = None
+
+    def ensure_browser():
+        nonlocal playwright, browser
+        if browser is not None:
+            try:
+                if browser.is_connected():
+                    return browser
+            except Exception:
+                pass
+            close_runtime()
+
+        if not os.path.exists(PLAYWRIGHT_CHROMIUM_BIN):
+            raise RuntimeError(f'Chromium not found at {PLAYWRIGHT_CHROMIUM_BIN}')
+
+        launch_args = ['--disable-dev-shm-usage']
+        if os.name != 'nt':
+            launch_args.append('--no-sandbox')
+
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.launch(
+            executable_path=PLAYWRIGHT_CHROMIUM_BIN,
+            headless=True,
+            args=launch_args,
+        )
+        return browser
+
+    try:
+        while True:
+            job = task_queue.get()
+            if job is PLAYWRIGHT_RENDER_STOP:
+                break
+
+            try:
+                current_browser = ensure_browser()
+                context = current_browser.new_context(
+                    viewport={'width': 1280, 'height': 2400},
+                    device_scale_factor=2,
+                )
+                try:
+                    page = context.new_page()
+                    page.set_content(job.document, wait_until='domcontentloaded')
+                    page.evaluate('document.fonts.ready')
+                    locator = page.locator('#capture')
+                    locator.wait_for()
+                    page.wait_for_timeout(120)
+                    job.result = locator.screenshot(type='png')
+                finally:
+                    context.close()
+            except Exception as exc:
+                close_runtime()
+                job.error = exc
+            finally:
+                job.event.set()
+    finally:
+        close_runtime()
+
+
+def ensure_markdown_render_queue():
+    global PLAYWRIGHT_RENDER_QUEUE, PLAYWRIGHT_RENDER_THREAD
+
+    with PLAYWRIGHT_WORKER_LOCK:
+        if (
+            PLAYWRIGHT_RENDER_QUEUE is not None and
+            PLAYWRIGHT_RENDER_THREAD is not None and
+            PLAYWRIGHT_RENDER_THREAD.is_alive()
+        ):
+            return PLAYWRIGHT_RENDER_QUEUE
+
+        PLAYWRIGHT_RENDER_QUEUE = queue.Queue()
+        PLAYWRIGHT_RENDER_THREAD = threading.Thread(
+            target=markdown_render_worker,
+            args=(PLAYWRIGHT_RENDER_QUEUE,),
+            name='markdown-render-worker',
+            daemon=True,
+        )
+        PLAYWRIGHT_RENDER_THREAD.start()
+        return PLAYWRIGHT_RENDER_QUEUE
+
+
+atexit.register(close_markdown_browser)
+
+
 def get_http_session():
     session = getattr(THREAD_LOCAL, 'http_session', None)
     if session is not None:
         return session
 
     session = requests.Session()
+    session.trust_env = False
     adapter = HTTPAdapter(
         pool_connections=UPSTREAM_POOL_CONNECTIONS,
         pool_maxsize=UPSTREAM_POOL_MAXSIZE,
@@ -93,7 +393,18 @@ def get_http_session():
     return session
 
 
-def upstream_request(method, url, *, headers=None, data=None, cookies=None, allow_redirects=False, stream=False, timeout=None):
+def upstream_request(
+    method,
+    url,
+    *,
+    headers=None,
+    data=None,
+    files=None,
+    cookies=None,
+    allow_redirects=False,
+    stream=False,
+    timeout=None,
+):
     session = get_http_session()
     # IMPORTANT: this proxy serves multiple users, while worker threads are reused.
     # requests.Session keeps an internal cookie jar by default; if we leave it as-is,
@@ -105,6 +416,7 @@ def upstream_request(method, url, *, headers=None, data=None, cookies=None, allo
         url=url,
         headers=headers,
         data=data,
+        files=files,
         cookies=cookies,
         verify=False,
         allow_redirects=allow_redirects,
@@ -263,6 +575,401 @@ def build_export_response(name, html_content):
         headers = build_attachment_headers(name, 'html', 'text/html; charset=utf-8')
         headers.append(('X-Export-Fallback', 'html'))
         return Response(rendered_html, 200, headers=headers)
+
+
+def is_escaped(value, index):
+    slashes = 0
+    cursor = index - 1
+    while cursor >= 0 and value[cursor] == '\\':
+        slashes += 1
+        cursor -= 1
+    return slashes % 2 == 1
+
+
+def looks_like_math(value):
+    stripped = (value or '').strip()
+    if not stripped:
+        return False
+    if re.fullmatch(r'[\d\s,.$%]+', stripped):
+        return False
+    return bool(re.search(r'[A-Za-z\\^_=+\-*/{}[\]()]', stripped))
+
+
+def wrap_inline_katex(value):
+    stripped = (value or '').strip()
+    if not looks_like_math(stripped):
+        return None
+    return f"$`{stripped}`$"
+
+
+def find_inline_math_end(value, start_index):
+    cursor = start_index
+    while cursor < len(value):
+        if value[cursor] == '$' and not is_escaped(value, cursor):
+            prev_char = value[cursor - 1] if cursor > 0 else ''
+            next_char = value[cursor + 1] if cursor + 1 < len(value) else ''
+            if prev_char != '$' and next_char != '$':
+                return cursor
+        cursor += 1
+    return -1
+
+
+def normalize_inline_math(line):
+    result = []
+    index = 0
+    in_code = False
+    code_ticks = 0
+
+    while index < len(line):
+        if line[index] == '`':
+            tick_start = index
+            while index < len(line) and line[index] == '`':
+                index += 1
+            tick_count = index - tick_start
+            if not in_code:
+                in_code = True
+                code_ticks = tick_count
+            elif tick_count == code_ticks:
+                in_code = False
+                code_ticks = 0
+            result.append('`' * tick_count)
+            continue
+
+        if in_code:
+            result.append(line[index])
+            index += 1
+            continue
+
+        if line.startswith(r'\(', index):
+            end_index = line.find(r'\)', index + 2)
+            if end_index != -1:
+                wrapped = wrap_inline_katex(line[index + 2:end_index])
+                if wrapped:
+                    result.append(wrapped)
+                    index = end_index + 2
+                    continue
+
+        if line[index] == '$' and not is_escaped(line, index):
+            next_char = line[index + 1] if index + 1 < len(line) else ''
+            if next_char not in {'$', '`'}:
+                end_index = find_inline_math_end(line, index + 1)
+                if end_index != -1:
+                    wrapped = wrap_inline_katex(line[index + 1:end_index])
+                    if wrapped:
+                        result.append(wrapped)
+                        index = end_index + 1
+                        continue
+
+        result.append(line[index])
+        index += 1
+
+    return ''.join(result)
+
+
+def normalize_markdown_math(markdown_text):
+    lines = (markdown_text or '').replace('\r\n', '\n').replace('\r', '\n').split('\n')
+    normalized = []
+    in_code_fence = False
+    fence_marker = ''
+    in_math_block = False
+    math_delimiter = ''
+    math_lines = []
+
+    for line in lines:
+        stripped = line.strip()
+        fence_match = re.match(r'^(```+|~~~+)', stripped)
+        if not in_math_block and fence_match:
+            marker = fence_match.group(1)
+            if not in_code_fence:
+                in_code_fence = True
+                fence_marker = marker
+            elif stripped.startswith(fence_marker[0]):
+                in_code_fence = False
+                fence_marker = ''
+            normalized.append(line)
+            continue
+
+        if not in_code_fence and in_math_block:
+            if (math_delimiter == '$$' and stripped == '$$') or (math_delimiter == r'\[' and stripped == r'\]'):
+                normalized.append('```math')
+                normalized.extend(math_lines)
+                normalized.append('```')
+                in_math_block = False
+                math_delimiter = ''
+                math_lines = []
+            else:
+                math_lines.append(line)
+            continue
+
+        if not in_code_fence:
+            if stripped == '$$':
+                in_math_block = True
+                math_delimiter = '$$'
+                math_lines = []
+                continue
+
+            if stripped == r'\[':
+                in_math_block = True
+                math_delimiter = r'\['
+                math_lines = []
+                continue
+
+            single_dollar = re.match(r'^\s*\$\$(.+?)\$\$\s*$', line)
+            if single_dollar:
+                normalized.append('```math')
+                normalized.append(single_dollar.group(1).strip())
+                normalized.append('```')
+                continue
+
+            single_bracket = re.match(r'^\s*\\\[(.+?)\\\]\s*$', line)
+            if single_bracket:
+                normalized.append('```math')
+                normalized.append(single_bracket.group(1).strip())
+                normalized.append('```')
+                continue
+
+            line = normalize_inline_math(line)
+
+        normalized.append(line)
+
+    if in_math_block:
+        normalized.append(math_delimiter)
+        normalized.extend(math_lines)
+
+    return '\n'.join(normalized)
+
+
+def sanitize_markdown_html(value):
+    soup = BeautifulSoup(value or '', 'html.parser')
+    for tag in soup.find_all(['script', 'iframe', 'object', 'embed', 'form', 'input', 'button', 'textarea', 'select']):
+        tag.decompose()
+
+    for tag in soup.find_all(True):
+        for attr_name in list(tag.attrs):
+            lowered = attr_name.lower()
+            if lowered.startswith('on'):
+                del tag.attrs[attr_name]
+                continue
+
+            if lowered not in {'href', 'src'}:
+                continue
+
+            raw_value = tag.attrs.get(attr_name)
+            values = raw_value if isinstance(raw_value, list) else [raw_value]
+            cleaned = []
+            for item in values:
+                item_text = str(item).strip()
+                if item_text.lower().startswith('javascript:'):
+                    continue
+                cleaned.append(item)
+
+            if not cleaned:
+                del tag.attrs[attr_name]
+            elif isinstance(raw_value, list):
+                tag.attrs[attr_name] = cleaned
+            else:
+                tag.attrs[attr_name] = cleaned[0]
+
+    return str(soup)
+
+
+def build_markdown_capture_html(html_body):
+    return """<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    %s
+  </head>
+  <body>
+    <div id="capture">%s</div>
+  </body>
+</html>""" % (MARKDOWN_CAPTURE_STYLE, html_body or '<p></p>')
+
+
+def build_markdown_cache_key(normalized_markdown):
+    return hashlib.sha256((normalized_markdown or '').encode('utf-8')).hexdigest()
+
+
+def ensure_markdown_cache_dir():
+    os.makedirs(MARKDOWN_CACHE_DIR, exist_ok=True)
+    return MARKDOWN_CACHE_DIR
+
+
+def get_markdown_cache_path(cache_key):
+    ensure_markdown_cache_dir()
+    return os.path.join(MARKDOWN_CACHE_DIR, f'{cache_key}.png')
+
+
+def get_cached_markdown_png(cache_key):
+    if not cache_key or not MARKDOWN_CACHE_KEY_RE.fullmatch(cache_key):
+        return None
+    cache_path = get_markdown_cache_path(cache_key)
+    if not os.path.exists(cache_path):
+        return None
+    with open(cache_path, 'rb') as cached_file:
+        return cached_file.read()
+
+
+def store_cached_markdown_png(cache_key, image_bytes):
+    if not cache_key or not MARKDOWN_CACHE_KEY_RE.fullmatch(cache_key):
+        raise ValueError('Invalid markdown cache key')
+    cache_path = get_markdown_cache_path(cache_key)
+    tmp_path = f'{cache_path}.tmp'
+    with open(tmp_path, 'wb') as cache_file:
+        cache_file.write(image_bytes)
+    os.replace(tmp_path, cache_path)
+    return cache_path
+
+
+def get_or_render_markdown_png(markdown_text, normalized_markdown=None):
+    normalized = normalized_markdown if normalized_markdown is not None else normalize_markdown_math(markdown_text or '')
+    cache_key = build_markdown_cache_key(normalized)
+
+    with MARKDOWN_CACHE_LOCK:
+        cached_bytes = get_cached_markdown_png(cache_key)
+        if cached_bytes is not None:
+            return cache_key, cached_bytes, True
+
+        image_bytes = render_markdown_png(markdown_text, normalized_markdown=normalized)
+        store_cached_markdown_png(cache_key, image_bytes)
+        return cache_key, image_bytes, False
+
+
+def render_markdown_html(markdown_text, normalized_markdown=None):
+    normalized = normalized_markdown if normalized_markdown is not None else normalize_markdown_math(markdown_text or '')
+    rendered = markdown.markdown(
+        normalized,
+        extensions=['extra', 'sane_lists', 'nl2br', 'markdown_katex'],
+        extension_configs={
+            'markdown_katex': {
+                'insert_fonts_css': True,
+                'no_inline_svg': False,
+            }
+        },
+    )
+    rendered = rewrite_html_assets(rendered)
+    return sanitize_markdown_html(rendered)
+
+
+def render_markdown_png(markdown_text, normalized_markdown=None):
+    html_body = render_markdown_html(markdown_text, normalized_markdown=normalized_markdown)
+    document = build_markdown_capture_html(html_body)
+
+    with PLAYWRIGHT_RENDER_LOCK:
+        job = MarkdownRenderJob(document)
+        ensure_markdown_render_queue().put(job)
+        if not job.event.wait(PLAYWRIGHT_RENDER_TIMEOUT):
+            close_markdown_browser()
+            raise RuntimeError('Markdown render timed out')
+        if job.error is not None:
+            raise job.error
+        return job.result
+
+
+def build_student_question_url(entity_type, entity_id, suffix):
+    return f'{TARGET_URL}/exam/api/student/{entity_type}/entity/{entity_id}/{suffix.lstrip("/")}'
+
+
+def get_student_question_entry(entity_type, entity_id, question_id):
+    resp = upstream_request(
+        method='GET',
+        url=build_student_question_url(entity_type, entity_id, 'question'),
+        headers=get_request_headers({'host'}),
+        cookies=request.cookies,
+        timeout=REQUEST_TIMEOUT,
+    )
+    try:
+        payload = resp.json()
+    finally:
+        resp.close()
+
+    if payload.get('code') not in {0, 33333}:
+        raise RuntimeError(payload.get('message') or 'Failed to load question answers')
+
+    entries = payload.get('extra') or []
+    for entry in entries:
+        if str(entry.get('questionId')) == str(question_id):
+            return entry
+    return None
+
+
+def find_existing_markdown_attachment(attachments, filename):
+    for item in attachments or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            question_attachment_type = int(item.get('questionAttachmentType'))
+        except (TypeError, ValueError):
+            question_attachment_type = None
+        try:
+            extra_tag = int(item.get('extraTag', 0))
+        except (TypeError, ValueError):
+            extra_tag = 0
+
+        if question_attachment_type != 5:
+            continue
+        if extra_tag != 0:
+            continue
+        names = {
+            str(item.get('attachmentName') or '').strip(),
+            str(item.get('name') or '').strip(),
+        }
+        if filename in names:
+            return item
+    return None
+
+
+def upload_generated_attachment(filename, content_bytes, content_type='image/png'):
+    upload_headers = get_request_headers({'host', 'content-length', 'content-type'})
+    resp = upstream_request(
+        method='POST',
+        url=f'{TARGET_URL}/exam/api/atta/upload',
+        headers=upload_headers,
+        files={'uploadFile': (filename, content_bytes, content_type)},
+        cookies=request.cookies,
+        timeout=REQUEST_TIMEOUT,
+    )
+    try:
+        payload = resp.json()
+    finally:
+        resp.close()
+
+    if payload.get('code') not in {0, 33333} or not isinstance(payload.get('extra'), dict):
+        raise RuntimeError(payload.get('message') or 'Markdown image upload failed')
+
+    attachment_id = payload['extra'].get('id')
+    if attachment_id is None:
+        raise RuntimeError('Upload did not return an attachment id')
+    return attachment_id
+
+
+def attach_uploaded_file_to_question(entity_type, entity_id, question_id, attachment_id):
+    attach_headers = get_request_headers({'host', 'content-length', 'content-type'})
+    resp = upstream_request(
+        method='POST',
+        url=build_student_question_url(
+            entity_type,
+            entity_id,
+            f'question/{question_id}/attachment/{attachment_id}',
+        ),
+        headers=attach_headers,
+        cookies=request.cookies,
+        timeout=REQUEST_TIMEOUT,
+    )
+    try:
+        payload = resp.json()
+    finally:
+        resp.close()
+
+    if payload.get('code') not in {0, 33333}:
+        raise RuntimeError(payload.get('message') or 'Failed to attach Markdown image to the question')
+    return payload
+
+
+def build_markdown_download_url(cache_key, filename):
+    quoted_name = parse.quote(filename or f'md-answer-{cache_key[:16]}.png')
+    return f'/exam/api/markdown-answer/cache/{cache_key}.png?name={quoted_name}'
 
 
 def sanitize_download_name(value, default='file'):
@@ -727,6 +1434,83 @@ def downloadBundle():
     return Response(zip_buffer.getvalue(), 200, headers=headers)
 
 
+@app.route('/exam/api/markdown-answer/cache/<string:cache_key>.png', methods=['GET'])
+def markdown_answer_cache_file(cache_key):
+    if not MARKDOWN_CACHE_KEY_RE.fullmatch(cache_key):
+        return jsonify({'message': 'Invalid cache key.'}), 400
+
+    image_bytes = get_cached_markdown_png(cache_key)
+    if image_bytes is None:
+        return jsonify({'message': 'Cached image not found.'}), 404
+
+    filename = sanitize_download_name(
+        parse.unquote(request.args.get('name') or f'md-answer-{cache_key[:16]}.png'),
+        f'md-answer-{cache_key[:16]}.png'
+    )
+    headers = [
+        ('Content-Type', 'image/png'),
+        ('Content-Disposition', f"attachment; filename*=UTF-8''{parse.quote(filename)}"),
+        ('Cache-Control', 'public, max-age=31536000, immutable'),
+    ]
+    return Response(image_bytes, 200, headers=headers)
+
+
+@app.route('/exam/api/markdown-answer', methods=['POST'])
+def markdown_answer():
+    payload = request.get_json(silent=True) or {}
+    entity_type = str(payload.get('entityType') or '').strip().lower()
+    if entity_type not in {'course', 'paper'}:
+        return jsonify({'message': 'Invalid entity type.'}), 400
+
+    try:
+        entity_id = int(payload.get('entityId'))
+        question_id = int(payload.get('questionId'))
+    except (TypeError, ValueError):
+        return jsonify({'message': 'Invalid entity id or question id.'}), 400
+
+    markdown_text = str(payload.get('markdown') or '')
+    if not markdown_text.strip():
+        return jsonify({'message': 'Markdown content cannot be empty.'}), 400
+    if len(markdown_text) > MARKDOWN_MAX_LENGTH:
+        return jsonify({'message': f'Markdown content exceeds the {MARKDOWN_MAX_LENGTH} character limit.'}), 400
+
+    normalized_markdown = normalize_markdown_math(markdown_text)
+    raw_filename = sanitize_download_name(
+        parse.unquote(str(payload.get('filename') or f'md-answer-{build_markdown_cache_key(normalized_markdown)[:16]}')),
+        'md-answer',
+    )
+    filename = raw_filename if raw_filename.lower().endswith('.png') else f'{raw_filename}.png'
+
+    try:
+        cache_key, image_bytes, cache_hit = get_or_render_markdown_png(markdown_text, normalized_markdown)
+    except Exception as exc:
+        app.logger.warning(
+            'markdown render failed for %s/%s/%s: %s',
+            entity_type,
+            entity_id,
+            question_id,
+            exc,
+        )
+        return jsonify({'message': str(exc) or 'Markdown answer generation failed.'}), 502
+
+    download_url = build_markdown_download_url(cache_key, filename)
+
+    return jsonify({
+        'code': 0,
+        'message': 'Markdown 图片已生成。',
+        'extra': {
+            'cacheKey': cache_key,
+            'cacheHit': cache_hit,
+            'filename': filename,
+            'downloadUrl': download_url,
+            'questionId': question_id,
+            'entityType': entity_type,
+            'entityId': entity_id,
+            'byteLength': len(image_bytes),
+        }
+    })
+
+
 @app.route("/getAllCourses")
 async def getAllCourses():
     req_headers = get_request_headers({'host'})
@@ -785,9 +1569,9 @@ def _stu_index_with_passive():
         body = resp.get_data(as_text=True)
         inj = ''.join([
             '<script>window.PASSIVE={passive:true};document.documentElement.classList.add(\'page-shell\');</script>',
-            '<link rel="preload" href="/stu/page-enhance.css?v=20260308j" as="style">',
-            '<link rel="stylesheet" href="/stu/page-enhance.css?v=20260308j">',
-            '<script defer src="/stu/page-enhance.js?v=20260307a"></script>',
+            '<link rel="preload" href="/stu/page-enhance.css?v=20260312md5" as="style">',
+            '<link rel="stylesheet" href="/stu/page-enhance.css?v=20260312md5">',
+            '<script defer src="/stu/page-enhance.js?v=20260312md5"></script>',
         ])
         if '</head>' in body:
             body = body.replace('</head>', inj + '</head>', 1)

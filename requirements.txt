@@ -5,3 +5,6 @@ pdfkit
 aiohttp
 gunicorn
 pycryptodome
+Markdown==3.10.2
+markdown-katex==202406.1035
+playwright==1.58.0
