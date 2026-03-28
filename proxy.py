@@ -1198,21 +1198,14 @@ def rewrite_exam_attachment_path(path):
         decoded_target = (decoded_target or '').strip()
         if not decoded_target:
             return path
-        if decoded_target.startswith('/'):
-            return decoded_target.lstrip('/')
+        decoded_target = decoded_target.lstrip('/')
         if decoded_target.startswith('exam/'):
             return decoded_target
         prefix_path = '/'.join(segment.strip('/') for segment in (prefix_segments or []) if segment.strip('/'))
-        if 'uploadFile/' in decoded_target:
-            if prefix_path and decoded_target.startswith(prefix_path + '/'):
-                return decoded_target
-            if prefix_path and decoded_target.startswith('uploadFile/'):
-                return f'{prefix_path}/{decoded_target}'
-            return decoded_target.lstrip('/')
         if prefix_path:
             if decoded_target.startswith(prefix_path + '/'):
-                return decoded_target
-            return f'{prefix_path}/{decoded_target}'
+                return f'exam/{decoded_target}'
+            return f'exam/{prefix_path}/{decoded_target}'
         return f'exam/{decoded_target}'
 
     decoded_target = decrypt_attachment_path(raw_target)
@@ -1435,27 +1428,35 @@ def downloadFile():
         return jsonify({'message': 'missing url'}), 400
 
     name = sanitize_download_name(request.args.get('name') or '', '')
-    upstream_url = normalize_remote_url(url)
+    upstream_url = build_upstream_attachment_url(url) or normalize_remote_url(url)
 
-    r = upstream_request(method='GET', url=upstream_url, timeout=REQUEST_TIMEOUT)
+    r = upstream_request(
+        method='GET',
+        url=upstream_url,
+        headers=get_request_headers({'host'}),
+        cookies=request.cookies,
+        allow_redirects=True,
+        timeout=REQUEST_TIMEOUT,
+    )
     try:
         content = r.content
         parsed = _parse.urlsplit(upstream_url)
         ext = os.path.splitext(parsed.path)[1].lstrip('.')
         content_type = r.headers.get('Content-Type', '').split(';', 1)[0].strip() or 'application/octet-stream'
 
+        if r.status_code >= 400:
+            headers = [('Content-Type', r.headers.get('Content-Type', 'application/json; charset=utf-8'))]
+            return Response(content, r.status_code, headers=headers)
+
         if not ext:
             guessed_ext = mimetypes.guess_extension(content_type) or ''
             ext = guessed_ext.lstrip('.')
-
-        if upstream_url.lower().endswith('.pdf') or content_type == 'application/pdf':
-            return Response(content, 200, [('Content-Type', 'application/pdf')])
 
         download_name = name or os.path.splitext(os.path.basename(parsed.path))[0] or 'download'
         filename = f'{download_name}.{ext}' if ext else download_name
         headers = [
             ("Content-Disposition", build_content_disposition(filename)),
-            ("Content-Type", "application/force-download")
+            ("Content-Type", content_type or "application/octet-stream")
         ]
         return Response(content, 200, headers)
     finally:
@@ -1943,17 +1944,35 @@ def normalize_pdf_viewer_file(file_value):
 @app.route('/exam/pdf/web/viewer.html')
 def redirect_pdf_viewer():
     params = []
+    should_redirect = False
+
     for key in request.args.keys():
         for value in request.args.getlist(key):
             if key == 'file':
-                value = normalize_pdf_viewer_file(value)
+                parsed_file = _parse.urlsplit(value or '')
+                if parsed_file.path != '/pdfproxy':
+                    source_path = normalize_pdf_viewer_file(value)
+                    value = f'/pdfproxy?url={parse.quote(source_path, safe="/:")}'
+                    should_redirect = True
             params.append((key, value))
 
-    query = parse.urlencode(params, doseq=True, quote_via=parse.quote, safe='/:')
-    target = f'{TARGET_URL}/exam/pdf/web/viewer.html'
-    if query:
-        target = f'{target}?{query}'
-    return redirect(target, code=302)
+    if should_redirect:
+        query = parse.urlencode(params, doseq=True, quote_via=parse.quote, safe='/:')
+        target = '/exam/pdf/web/viewer.html'
+        if query:
+            target = f'{target}?{query}'
+        return redirect(target, code=302)
+
+    upstream_response = upstream_request(
+        method='GET',
+        url=f'{TARGET_URL}/exam/pdf/web/viewer.html',
+        headers=get_request_headers({'host'}),
+        cookies=request.cookies,
+        allow_redirects=False,
+        stream=True,
+        timeout=REQUEST_TIMEOUT,
+    )
+    return build_streaming_response(upstream_response, cache_disabled=True)
 
 
 @app.route('/stu/project.config.js')

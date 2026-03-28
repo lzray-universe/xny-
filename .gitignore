@@ -7,3 +7,6 @@
 /exam/jyhr/*
 __pycache__/
 *.pyc
+/.vendor/
+/run_local.out.log
+/run_local.err.log
