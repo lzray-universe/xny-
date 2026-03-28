@@ -45,14 +45,14 @@ DEFAULT_CJK_SANS_FONT_STACK = (
     '"WenQuanYi Micro Hei", "SimHei", sans-serif'
 )
 
-PDF_HTML_STYLE = f"""<style>
+PDF_HTML_STYLE = """<style>
 img { max-width: 100%; height: auto; }
 body { margin: 0; color: #16313a; }
-body, table, td, th { font-family: {DEFAULT_CJK_SANS_FONT_STACK}; }
+body, table, td, th { __DEFAULT_CJK_FONT_DECL__ }
 p, li { line-height: 1.75; }
 table { width: 100%; border-collapse: collapse; }
 td, th { border: 1px solid #d9e2e8; padding: 6px 8px; }
-</style>"""
+</style>""".replace('__DEFAULT_CJK_FONT_DECL__', f'font-family: {DEFAULT_CJK_SANS_FONT_STACK};')
 PDFKIT_CONFIG = None
 PDFKIT_READY = False
 
@@ -120,7 +120,7 @@ PLAYWRIGHT_RENDER_QUEUE = None
 PLAYWRIGHT_RENDER_THREAD = None
 PLAYWRIGHT_RENDER_STOP = object()
 PLAYWRIGHT_RENDER_TIMEOUT = int(os.environ.get('PLAYWRIGHT_RENDER_TIMEOUT', str(max(REQUEST_TIMEOUT, 60))))
-MARKDOWN_CAPTURE_STYLE = f"""<style>
+MARKDOWN_CAPTURE_STYLE = """<style>
 html, body {
   margin: 0;
   padding: 0;
@@ -128,7 +128,7 @@ html, body {
 }
 body {
   color: #0f172a;
-  font-family: {DEFAULT_CJK_SANS_FONT_STACK};
+  __DEFAULT_CJK_FONT_DECL__
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   background: #ffffff;
@@ -248,7 +248,7 @@ body {
   overflow-y: hidden;
   padding: 0.1em 0.02em;
 }
-</style>"""
+</style>""".replace('__DEFAULT_CJK_FONT_DECL__', f'font-family: {DEFAULT_CJK_SANS_FONT_STACK};')
 
 
 class MarkdownRenderJob:
