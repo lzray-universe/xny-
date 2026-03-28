@@ -1195,14 +1195,24 @@ def rewrite_exam_attachment_path(path):
         return path
 
     def normalize_decoded_target(decoded_target, prefix_segments=None):
-        decoded_target = decoded_target.lstrip('/')
+        decoded_target = (decoded_target or '').strip()
+        if not decoded_target:
+            return path
+        if decoded_target.startswith('/'):
+            return decoded_target.lstrip('/')
         if decoded_target.startswith('exam/'):
             return decoded_target
         prefix_path = '/'.join(segment.strip('/') for segment in (prefix_segments or []) if segment.strip('/'))
+        if 'uploadFile/' in decoded_target:
+            if prefix_path and decoded_target.startswith(prefix_path + '/'):
+                return decoded_target
+            if prefix_path and decoded_target.startswith('uploadFile/'):
+                return f'{prefix_path}/{decoded_target}'
+            return decoded_target.lstrip('/')
         if prefix_path:
             if decoded_target.startswith(prefix_path + '/'):
-                return f'exam/{decoded_target}'
-            return f'exam/{prefix_path}/{decoded_target}'
+                return decoded_target
+            return f'{prefix_path}/{decoded_target}'
         return f'exam/{decoded_target}'
 
     decoded_target = decrypt_attachment_path(raw_target)
