@@ -439,10 +439,15 @@ def get_request_headers(exclude=None):
 
 def filter_upstream_headers(headers, excluded=None):
     excluded_headers = {h.lower() for h in (excluded or [])}
-    return [
-        (name, value) for (name, value) in headers.items()
-        if name.lower() not in excluded_headers and name.lower() != 'set-cookie'
-    ]
+    filtered = []
+    for name, value in headers.items():
+        lower_name = name.lower()
+        if lower_name in excluded_headers or lower_name == 'set-cookie':
+            continue
+        if lower_name == 'content-disposition':
+            value = normalize_content_disposition(value)
+        filtered.append((name, value))
+    return filtered
 
 
 def set_requests_cookies(response, upstream_response):
@@ -563,10 +568,10 @@ def render_pdf_bytes(rendered_html):
 
 
 def build_attachment_headers(name, extension, content_type):
-    base_name = (name or 'export').strip() or 'export'
-    quoted_name = parse.quote(f"{base_name}.{extension}")
+    base_name = sanitize_download_name(name or 'export', 'export')
+    filename = f'{base_name}.{extension}'
     return [
-        ('Content-Disposition', f"attachment; filename*=UTF-8''{quoted_name}"),
+        ('Content-Disposition', build_content_disposition(filename)),
         ('Content-Type', content_type),
     ]
 
@@ -979,10 +984,83 @@ def build_markdown_download_url(cache_key, filename):
     return f'/exam/api/markdown-answer/cache/{cache_key}.png?name={quoted_name}'
 
 
+def decode_percent_escapes(value, max_rounds=2):
+    decoded = str(value or '')
+    for _ in range(max_rounds):
+        if '%' not in decoded:
+            break
+        try:
+            next_value = _parse.unquote(decoded)
+        except Exception:
+            break
+        if next_value == decoded:
+            break
+        decoded = next_value
+    return decoded
+
+
 def sanitize_download_name(value, default='file'):
-    name = re.sub(r'[<>:"/\\|?*]+', '-', (value or '').strip())
+    name = decode_percent_escapes(value or '').strip()
+    name = re.sub(r'[<>:"/\\|?*]+', '-', name)
     name = re.sub(r'\s+', ' ', name).strip(' .')
     return name or default
+
+
+def build_content_disposition(filename, disposition='attachment'):
+    clean_name = sanitize_download_name(filename or '', 'download')
+    stem, ext = os.path.splitext(clean_name)
+    ascii_stem = re.sub(r'[^A-Za-z0-9._ -]+', '_', stem).strip(' ._') or 'download'
+    ascii_ext = re.sub(r'[^A-Za-z0-9.]+', '', ext)
+    ascii_name = f'{ascii_stem}{ascii_ext}'
+    quoted_name = parse.quote(clean_name)
+    return f'{disposition}; filename="{ascii_name}"; filename*=UTF-8\'\'{quoted_name}'
+
+
+def normalize_content_disposition(value):
+    header_value = str(value or '').strip()
+    if not header_value:
+        return header_value
+
+    filename = ''
+    encoded_match = re.search(r"filename\*\s*=\s*(?:UTF-8'')?([^;]+)", header_value, re.IGNORECASE)
+    if encoded_match:
+        filename = decode_percent_escapes(encoded_match.group(1).strip().strip('"'))
+
+    if not filename:
+        plain_match = re.search(r'filename\s*=\s*"?(?P<name>[^";]+)"?', header_value, re.IGNORECASE)
+        if plain_match:
+            filename = decode_percent_escapes(plain_match.group('name').strip())
+
+    clean_name = sanitize_download_name(filename, '')
+    if not clean_name:
+        return header_value
+
+    disposition = 'inline' if header_value.lower().startswith('inline') else 'attachment'
+    return build_content_disposition(clean_name, disposition=disposition)
+
+
+def extract_download_name(payload, default='attachment'):
+    candidates = []
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key in ('attachmentName', 'attachmentExtraName', 'fileName', 'filename', 'name', 'title'):
+                raw = value.get(key)
+                if isinstance(raw, str) and raw.strip():
+                    candidates.append(raw.strip())
+            for nested in value.values():
+                walk(nested)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(payload)
+
+    for raw in candidates:
+        clean_name = sanitize_download_name(raw, '')
+        if clean_name:
+            return clean_name
+    return default
 
 
 def extract_download_url(payload):
@@ -1012,7 +1090,7 @@ def extract_download_url(payload):
     walk(payload)
 
     for raw in candidates:
-        normalized = normalize_remote_url(raw)
+        normalized = build_upstream_attachment_url(raw)
         parsed = _parse.urlsplit(normalized)
         if parsed.scheme in {'http', 'https'} and parsed.netloc:
             return normalized
@@ -1056,7 +1134,7 @@ def build_upstream_attachment_url(value):
 
 
 def guess_download_name(preferred_name, source_url, content_type, index):
-    cleaned = sanitize_download_name(_parse.unquote(preferred_name or ''), '')
+    cleaned = sanitize_download_name(preferred_name or '', '')
     path_name = sanitize_download_name(os.path.basename(_parse.urlsplit(source_url).path), '')
     path_ext = os.path.splitext(path_name)[1]
     if not path_ext:
@@ -1112,14 +1190,33 @@ def decrypt_attachment_path(value):
 def rewrite_exam_attachment_path(path):
     if not path.startswith('exam/'):
         return path
-    raw_target = path[5:]
-    decoded_target = decrypt_attachment_path(raw_target)
-    if decoded_target == raw_target:
+    raw_target = path[5:].strip('/')
+    if not raw_target:
         return path
-    decoded_target = decoded_target.lstrip('/')
-    if decoded_target.startswith('exam/'):
-        return decoded_target
-    return f'exam/{decoded_target}'
+
+    def normalize_decoded_target(decoded_target, prefix_segments=None):
+        decoded_target = decoded_target.lstrip('/')
+        if decoded_target.startswith('exam/'):
+            return decoded_target
+        prefix_path = '/'.join(segment.strip('/') for segment in (prefix_segments or []) if segment.strip('/'))
+        if prefix_path:
+            if decoded_target.startswith(prefix_path + '/'):
+                return f'exam/{decoded_target}'
+            return f'exam/{prefix_path}/{decoded_target}'
+        return f'exam/{decoded_target}'
+
+    decoded_target = decrypt_attachment_path(raw_target)
+    if decoded_target != raw_target:
+        return normalize_decoded_target(decoded_target)
+
+    segments = [segment for segment in raw_target.split('/') if segment]
+    for index in range(len(segments) - 1, -1, -1):
+        decoded_segment = decrypt_attachment_path(segments[index])
+        if decoded_segment == segments[index]:
+            continue
+        return normalize_decoded_target(decoded_segment, prefix_segments=segments[:index])
+
+    return path
 
 
 def rewrite_html_assets(value):
@@ -1127,7 +1224,7 @@ def rewrite_html_assets(value):
 
     for tag in soup.find_all(['img', 'source', 'audio', 'video']):
         candidate = tag.get('data-href') or tag.get('data-src') or tag.get('src')
-        normalized = normalize_remote_url(candidate)
+        normalized = build_upstream_attachment_url(candidate)
         if normalized:
             tag['src'] = normalized
             if tag.has_attr('data-href'):
@@ -1137,7 +1234,7 @@ def rewrite_html_assets(value):
 
     for tag in soup.find_all('a'):
         href = tag.get('href')
-        normalized = normalize_remote_url(href)
+        normalized = build_upstream_attachment_url(href)
         if normalized and href != '#':
             tag['href'] = normalized
 
@@ -1347,7 +1444,7 @@ def downloadFile():
         download_name = name or os.path.splitext(os.path.basename(parsed.path))[0] or 'download'
         filename = f'{download_name}.{ext}' if ext else download_name
         headers = [
-            ("Content-Disposition", f"attachment; filename*=UTF-8''{parse.quote(filename)}"),
+            ("Content-Disposition", build_content_disposition(filename)),
             ("Content-Type", "application/force-download")
         ]
         return Response(content, 200, headers)
@@ -1456,7 +1553,7 @@ def markdown_answer_cache_file(cache_key):
     )
     headers = [
         ('Content-Type', 'image/png'),
-        ('Content-Disposition', f"attachment; filename*=UTF-8''{parse.quote(filename)}"),
+        ('Content-Disposition', build_content_disposition(filename)),
         ('Cache-Control', 'public, max-age=31536000, immutable'),
     ]
     return Response(image_bytes, 200, headers=headers)
@@ -1828,19 +1925,9 @@ def normalize_pdf_viewer_file(file_value):
     if value.startswith(('http://', 'https://')):
         value = _parse.urlsplit(value).path or value
 
-    if value.startswith('/exam/'):
-        value = value[len('/exam/'):]
-    elif value.startswith('exam/'):
-        value = value[len('exam/'):]
-
-    value = value.replace(' ', '+')
-
-    decoded = decrypt_attachment_path(value)
-    if decoded.startswith('/exam/'):
-        return decoded
-    if decoded.startswith('exam/'):
-        return '/' + decoded
-    return '/exam/' + decoded.lstrip('/')
+    value = value.lstrip('/').replace(' ', '+')
+    normalized = rewrite_exam_attachment_path(value if value.startswith('exam/') else f'exam/{value}')
+    return '/' + normalized.lstrip('/')
 
 
 @app.route('/exam/pdf/web/viewer.html')
@@ -1914,9 +2001,10 @@ def _proxy_attachment_api(tp, entity_id, question_id, attachment_id, extra_segme
             guessed_ext = mimetypes.guess_extension(content_type) or ''
             ext = guessed_ext.lstrip('.')
 
-        filename = f'attachment.{ext}' if ext else 'attachment'
+        preferred_name = extract_download_name(payload, default='attachment')
+        filename = guess_download_name(preferred_name, download_url, content_type, 1)
         headers = [
-            ("Content-Disposition", f"attachment; filename*=UTF-8''{parse.quote(filename)}"),
+            ("Content-Disposition", build_content_disposition(filename)),
             ("Content-Type", "application/force-download")
         ]
         return Response(content, 200, headers)
