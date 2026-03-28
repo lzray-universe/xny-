@@ -39,10 +39,16 @@ ATTACHMENT_KEY = os.environ.get('ATTACHMENT_AES_KEY', '348ebfa6d1f9708310cb8a7f8
 ATTACHMENT_PATH_RE = re.compile(r'^[A-Za-z0-9+/=]+$')
 ENHANCE_ASSET_VERSION = '20260312-speedup2'
 
-PDF_HTML_STYLE = """<style>
+DEFAULT_CJK_SANS_FONT_STACK = (
+    '"Noto Sans CJK SC", "Noto Sans SC", "Source Han Sans SC", '
+    '"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", '
+    '"WenQuanYi Micro Hei", "SimHei", sans-serif'
+)
+
+PDF_HTML_STYLE = f"""<style>
 img { max-width: 100%; height: auto; }
 body { margin: 0; color: #16313a; }
-body, table, td, th { font-family: 'Noto Sans CJK', 'WenQuanYi Zen Hei', 'Microsoft YaHei', sans-serif; }
+body, table, td, th { font-family: {DEFAULT_CJK_SANS_FONT_STACK}; }
 p, li { line-height: 1.75; }
 table { width: 100%; border-collapse: collapse; }
 td, th { border: 1px solid #d9e2e8; padding: 6px 8px; }
@@ -114,7 +120,7 @@ PLAYWRIGHT_RENDER_QUEUE = None
 PLAYWRIGHT_RENDER_THREAD = None
 PLAYWRIGHT_RENDER_STOP = object()
 PLAYWRIGHT_RENDER_TIMEOUT = int(os.environ.get('PLAYWRIGHT_RENDER_TIMEOUT', str(max(REQUEST_TIMEOUT, 60))))
-MARKDOWN_CAPTURE_STYLE = """<style>
+MARKDOWN_CAPTURE_STYLE = f"""<style>
 html, body {
   margin: 0;
   padding: 0;
@@ -122,7 +128,7 @@ html, body {
 }
 body {
   color: #0f172a;
-  font-family: "Noto Sans CJK", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-family: {DEFAULT_CJK_SANS_FONT_STACK};
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   background: #ffffff;
