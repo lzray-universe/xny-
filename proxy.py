@@ -28,6 +28,8 @@ from playwright.sync_api import sync_playwright
 from flask import Flask, request, Response, redirect, send_from_directory, make_response, jsonify
 
 TARGET_URL = os.environ.get('TARGET_URL', 'https://bdfz.xnykcxt.com:5002')
+TARGET_URL_PARTS = parse.urlsplit(TARGET_URL)
+TARGET_ORIGIN = f'{TARGET_URL_PARTS.scheme}://{TARGET_URL_PARTS.netloc}'
 REQUEST_TIMEOUT = int(os.environ.get('REQUEST_TIMEOUT', '120'))
 STREAM_TIMEOUT = (10, REQUEST_TIMEOUT)
 UPSTREAM_POOL_CONNECTIONS = int(os.environ.get('UPSTREAM_POOL_CONNECTIONS', '64'))
@@ -434,7 +436,33 @@ def upstream_request(
 
 def get_request_headers(exclude=None):
     exclude = {h.lower() for h in (exclude or set())}
-    return {key: value for key, value in request.headers if key.lower() not in exclude}
+    headers = {key: value for key, value in request.headers if key.lower() not in exclude}
+
+    if 'origin' not in exclude:
+        headers['Origin'] = TARGET_ORIGIN
+
+    if 'referer' not in exclude:
+        referer = request.headers.get('Referer', '').strip()
+        if referer:
+            parsed = parse.urlsplit(referer)
+            if parsed.scheme and parsed.netloc:
+                referer = parse.urlunsplit((
+                    TARGET_URL_PARTS.scheme,
+                    TARGET_URL_PARTS.netloc,
+                    parsed.path or '/',
+                    parsed.query,
+                    parsed.fragment,
+                ))
+            else:
+                referer = f'{TARGET_ORIGIN}/stu/'
+        else:
+            referer = f'{TARGET_ORIGIN}/stu/'
+        headers['Referer'] = referer
+
+    if 'accept' not in exclude and request.path.startswith('/exam/') and '/api/' in request.path:
+        headers.setdefault('Accept', 'application/json, text/plain, */*')
+
+    return headers
 
 
 def filter_upstream_headers(headers, excluded=None):
