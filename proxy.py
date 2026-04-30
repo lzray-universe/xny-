@@ -1161,6 +1161,43 @@ def build_upstream_attachment_url(value):
     return f'{TARGET_URL}/{normalized.lstrip("/")}'
 
 
+def to_proxy_attachment_url(value):
+    raw = (value or '').strip()
+    if not raw:
+        return ''
+    if raw.startswith(('data:', 'blob:')):
+        return raw
+
+    parsed = _parse.urlsplit(raw)
+    path = ''
+    query = ''
+    fragment = ''
+
+    if parsed.scheme and parsed.netloc:
+        if parsed.netloc.lower() != TARGET_URL_PARTS.netloc.lower():
+            return raw
+        path = parsed.path or ''
+        query = parsed.query
+        fragment = parsed.fragment
+    else:
+        local = _parse.urlsplit(raw)
+        path = local.path or ''
+        query = local.query
+        fragment = local.fragment
+
+    path = _parse.unquote(path).replace(' ', '+').lstrip('/')
+    if not path:
+        return raw
+
+    normalized = rewrite_exam_attachment_path(path if path.startswith('exam/') else f'exam/{path}')
+    proxied = '/' + normalized.lstrip('/')
+    if query:
+        proxied = f'{proxied}?{query}'
+    if fragment:
+        proxied = f'{proxied}#{fragment}'
+    return proxied
+
+
 def guess_download_name(preferred_name, source_url, content_type, index):
     cleaned = sanitize_download_name(preferred_name or '', '')
     path_name = sanitize_download_name(os.path.basename(_parse.urlsplit(source_url).path), '')
@@ -1256,18 +1293,20 @@ def rewrite_html_assets(value):
     for tag in soup.find_all(['img', 'source', 'audio', 'video']):
         candidate = tag.get('data-href') or tag.get('data-src') or tag.get('src')
         normalized = build_upstream_attachment_url(candidate)
-        if normalized:
-            tag['src'] = normalized
+        proxied = to_proxy_attachment_url(normalized)
+        if proxied:
+            tag['src'] = proxied
             if tag.has_attr('data-href'):
-                tag['data-href'] = normalized
+                tag['data-href'] = proxied
             if tag.has_attr('data-src'):
-                tag['data-src'] = normalized
+                tag['data-src'] = proxied
 
     for tag in soup.find_all('a'):
         href = tag.get('href')
         normalized = build_upstream_attachment_url(href)
-        if normalized and href != '#':
-            tag['href'] = normalized
+        proxied = to_proxy_attachment_url(normalized)
+        if proxied and href != '#':
+            tag['href'] = proxied
 
     return str(soup)
 
