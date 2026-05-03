@@ -10,3 +10,6 @@ __pycache__/
 /.vendor/
 /run_local.out.log
 /run_local.err.log
+/data/
+*.sqlite3
+*.sqlite3-*

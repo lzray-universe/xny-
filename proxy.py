@@ -10,6 +10,12 @@ import zipfile
 import threading
 import atexit
 import queue
+import sqlite3
+from datetime import datetime, timezone
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 from bs4 import BeautifulSoup
 import requests
 from requests.adapters import HTTPAdapter
@@ -35,6 +41,9 @@ STREAM_TIMEOUT = (10, REQUEST_TIMEOUT)
 UPSTREAM_POOL_CONNECTIONS = int(os.environ.get('UPSTREAM_POOL_CONNECTIONS', '64'))
 UPSTREAM_POOL_MAXSIZE = int(os.environ.get('UPSTREAM_POOL_MAXSIZE', '64'))
 STREAM_CHUNK_SIZE = 64 * 1024
+DEFAULT_STATS_DB_PATH = os.path.join('data', 'xny_stats.sqlite3')
+STATS_DB_PATH = os.environ.get('STAT_DB_PATH', DEFAULT_STATS_DB_PATH)
+STATS_TIMEZONE_NAME = os.environ.get('STAT_TIMEZONE', 'Asia/Shanghai')
 
 app = Flask(__name__)
 ATTACHMENT_KEY = os.environ.get('ATTACHMENT_AES_KEY', '348ebfa6d1f9708310cb8a7f88367bc5').encode('utf-8')
@@ -59,6 +68,8 @@ PDFKIT_CONFIG = None
 PDFKIT_READY = False
 
 THREAD_LOCAL = threading.local()
+STATS_INIT_LOCK = threading.Lock()
+STATS_DB_READY = False
 HOP_BY_HOP_HEADERS = {
     'connection',
     'keep-alive',
@@ -69,6 +80,267 @@ HOP_BY_HOP_HEADERS = {
     'transfer-encoding',
     'upgrade',
 }
+
+
+def get_stats_timezone():
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(STATS_TIMEZONE_NAME)
+        except Exception:
+            pass
+    return timezone.utc
+
+
+STATS_TIMEZONE = get_stats_timezone()
+
+
+def stats_now():
+    return datetime.now(STATS_TIMEZONE)
+
+
+def stats_timestamp():
+    return stats_now().isoformat(timespec='seconds')
+
+
+def stats_day():
+    return stats_now().strftime('%Y-%m-%d')
+
+
+def ensure_stats_db():
+    global STATS_DB_READY
+    if STATS_DB_READY:
+        return
+
+    with STATS_INIT_LOCK:
+        if STATS_DB_READY:
+            return
+
+        db_dir = os.path.dirname(os.path.abspath(STATS_DB_PATH))
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+
+        with sqlite3.connect(STATS_DB_PATH, timeout=30) as conn:
+            conn.execute('PRAGMA busy_timeout = 30000')
+            conn.execute('PRAGMA journal_mode = WAL')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS traffic_daily (
+                    day TEXT PRIMARY KEY,
+                    upload_bytes INTEGER NOT NULL DEFAULT 0,
+                    download_bytes INTEGER NOT NULL DEFAULT 0,
+                    request_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                )
+            ''')
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS students (
+                    student_id TEXT PRIMARY KEY,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    login_count INTEGER NOT NULL DEFAULT 0
+                )
+            ''')
+            conn.commit()
+
+        STATS_DB_READY = True
+
+
+def stats_connect():
+    ensure_stats_db()
+    conn = sqlite3.connect(STATS_DB_PATH, timeout=30)
+    conn.execute('PRAGMA busy_timeout = 30000')
+    return conn
+
+
+def int_byte_length(value):
+    if value is None:
+        return 0
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return len(value)
+    if isinstance(value, str):
+        return len(value.encode('utf-8'))
+    try:
+        return len(value)
+    except Exception:
+        return 0
+
+
+def record_proxy_traffic(upload_bytes=0, download_bytes=0, request_count=0):
+    upload_bytes = max(0, int(upload_bytes or 0))
+    download_bytes = max(0, int(download_bytes or 0))
+    request_count = max(0, int(request_count or 0))
+    if upload_bytes == 0 and download_bytes == 0 and request_count == 0:
+        return
+
+    day = stats_day()
+    updated_at = stats_timestamp()
+    try:
+        with stats_connect() as conn:
+            conn.execute(
+                '''
+                INSERT INTO traffic_daily(day, upload_bytes, download_bytes, request_count, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(day) DO UPDATE SET
+                    upload_bytes = upload_bytes + excluded.upload_bytes,
+                    download_bytes = download_bytes + excluded.download_bytes,
+                    request_count = request_count + excluded.request_count,
+                    updated_at = excluded.updated_at
+                ''',
+                (day, upload_bytes, download_bytes, request_count, updated_at),
+            )
+            conn.commit()
+    except Exception:
+        app.logger.exception('failed to record proxy traffic stats')
+
+
+def record_student_login(student_id):
+    student_id = str(student_id or '').strip()
+    if not student_id:
+        return
+
+    now = stats_timestamp()
+    try:
+        with stats_connect() as conn:
+            conn.execute(
+                '''
+                INSERT INTO students(student_id, first_seen, last_seen, login_count)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(student_id) DO UPDATE SET
+                    last_seen = excluded.last_seen,
+                    login_count = login_count + 1
+                ''',
+                (student_id, now, now),
+            )
+            conn.commit()
+    except Exception:
+        app.logger.exception('failed to record student stats')
+
+
+def extract_student_id_from_payload(payload):
+    if not isinstance(payload, dict):
+        return ''
+
+    for key in (
+        'studentNo',
+        'studentNumber',
+        'studentCode',
+        'studentId',
+        'stuNo',
+        'stuNumber',
+        'stuCode',
+        'userCode',
+        'loginName',
+        'phoneNumber',
+        'account',
+        'username',
+    ):
+        value = payload.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+
+    for value in payload.values():
+        if isinstance(value, dict):
+            nested = extract_student_id_from_payload(value)
+            if nested:
+                return nested
+    return ''
+
+
+def extract_student_id_from_login(login_payload, response_payload):
+    submitted_id = ''
+    if isinstance(login_payload, dict):
+        submitted_id = str(login_payload.get('phoneNumber') or login_payload.get('username') or '').strip()
+
+    if submitted_id:
+        return submitted_id
+
+    response_id = ''
+    if isinstance(response_payload, dict) and response_payload.get('code') == 0:
+        response_id = extract_student_id_from_payload(response_payload.get('extra') or response_payload)
+
+    return response_id
+
+
+def maybe_record_login(path, request_body, response_body):
+    if path != 'exam/login/api/stu/signin':
+        return
+
+    try:
+        login_payload = json.loads((request_body or b'{}').decode('utf-8'))
+    except Exception:
+        login_payload = {}
+
+    try:
+        response_payload = json.loads((response_body or b'{}').decode('utf-8'))
+    except Exception:
+        response_payload = {}
+
+    if not isinstance(response_payload, dict) or response_payload.get('code') != 0:
+        return
+
+    student_id = extract_student_id_from_login(login_payload, response_payload)
+    record_student_login(student_id)
+
+
+def get_stats_snapshot(limit=None):
+    try:
+        with stats_connect() as conn:
+            total_row = conn.execute(
+                '''
+                SELECT
+                    COALESCE(SUM(upload_bytes), 0),
+                    COALESCE(SUM(download_bytes), 0),
+                    COALESCE(SUM(request_count), 0)
+                FROM traffic_daily
+                '''
+            ).fetchone()
+            unique_students = conn.execute('SELECT COUNT(*) FROM students').fetchone()[0]
+            daily_sql = '''
+                SELECT day, upload_bytes, download_bytes, request_count, updated_at
+                FROM traffic_daily
+                ORDER BY day DESC
+            '''
+            daily_args = ()
+            if limit is not None:
+                daily_sql += ' LIMIT ?'
+                daily_args = (limit,)
+            daily_rows = conn.execute(daily_sql, daily_args).fetchall()
+    except Exception:
+        app.logger.exception('failed to read stats snapshot')
+        return {
+            'ok': False,
+            'message': 'failed to read stats',
+            'uniqueStudents': 0,
+            'totalUploadBytes': 0,
+            'totalDownloadBytes': 0,
+            'totalBytes': 0,
+            'totalRequests': 0,
+            'daily': [],
+        }
+
+    total_upload, total_download, total_requests = total_row
+    daily = [
+        {
+            'day': row[0],
+            'uploadBytes': row[1],
+            'downloadBytes': row[2],
+            'totalBytes': row[1] + row[2],
+            'requestCount': row[3],
+            'updatedAt': row[4],
+        }
+        for row in reversed(daily_rows)
+    ]
+
+    return {
+        'ok': True,
+        'timezone': STATS_TIMEZONE_NAME,
+        'generatedAt': stats_timestamp(),
+        'uniqueStudents': unique_students,
+        'totalUploadBytes': total_upload,
+        'totalDownloadBytes': total_download,
+        'totalBytes': total_upload + total_download,
+        'totalRequests': total_requests,
+        'daily': daily,
+    }
 
 
 def resolve_wkhtmltopdf_path():
@@ -420,7 +692,15 @@ def upstream_request(
     # cookies from a previous user can be reused on later requests handled by the
     # same thread, causing account/session crossover.
     session.cookies.clear()
-    return session.request(
+    upload_bytes = int_byte_length(data)
+    if upload_bytes == 0 and request is not None:
+        try:
+            upload_bytes = int(request.content_length or 0)
+        except Exception:
+            upload_bytes = 0
+    record_proxy_traffic(upload_bytes=upload_bytes, request_count=1)
+
+    response = session.request(
         method=method,
         url=url,
         headers=headers,
@@ -432,6 +712,11 @@ def upstream_request(
         stream=stream,
         timeout=timeout or REQUEST_TIMEOUT,
     )
+    if not stream:
+        response_body = response.content
+        record_proxy_traffic(download_bytes=len(response_body))
+        response._xny_stats_download_recorded = True
+    return response
 
 
 def get_request_headers(exclude=None):
@@ -503,11 +788,14 @@ def build_streaming_response(upstream_response, *, extra_headers=None, cache_dis
         response = Response(status=upstream_response.status_code, headers=headers)
     else:
         def generate():
+            downloaded = 0
             try:
                 for chunk in upstream_response.raw.stream(STREAM_CHUNK_SIZE, decode_content=False):
                     if chunk:
+                        downloaded += len(chunk)
                         yield chunk
             finally:
+                record_proxy_traffic(download_bytes=downloaded)
                 upstream_response.close()
 
         response = Response(generate(), status=upstream_response.status_code, headers=headers)
@@ -522,8 +810,11 @@ def build_streaming_response(upstream_response, *, extra_headers=None, cache_dis
 
 
 async def get(session, url, headers=None):
+    record_proxy_traffic(request_count=1)
     async with session.get(url, headers=headers) as response:
-        return await response.json(content_type=None)
+        raw = await response.read()
+        record_proxy_traffic(download_bytes=len(raw))
+        return json.loads(raw.decode(response.charset or 'utf-8'))
 
 
 def getName():
@@ -1320,11 +1611,35 @@ def extract_catalog_names(data, result_list, subject_map):
 
 
 def api(path):
+    request_body = request.get_data()
+    if path == 'exam/login/api/stu/signin':
+        resp = upstream_request(
+            method=request.method,
+            url=f'{TARGET_URL}/{path}',
+            headers=get_request_headers({'host'}),
+            data=request_body,
+            cookies=request.cookies,
+            allow_redirects=False,
+            stream=False,
+            timeout=REQUEST_TIMEOUT,
+        )
+        try:
+            content = resp.content
+            maybe_record_login(path, request_body, content)
+            headers = filter_upstream_headers(
+                resp.raw.headers,
+                excluded=['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+            )
+            response = Response(content, resp.status_code, headers)
+            return set_requests_cookies(response, resp)
+        finally:
+            resp.close()
+
     resp = upstream_request(
         method=request.method,
         url=f'{TARGET_URL}/{path}',
         headers=get_request_headers({'host'}),
-        data=request.get_data(),
+        data=request_body,
         cookies=request.cookies,
         allow_redirects=False,
         stream=True,
@@ -1590,9 +1905,12 @@ def downloadBundle():
                         used_names,
                     )
                     with archive.open(download_name, 'w') as target_file:
+                        downloaded_bytes = 0
                         for chunk in upstream_response.iter_content(chunk_size=STREAM_CHUNK_SIZE):
                             if chunk:
+                                downloaded_bytes += len(chunk)
                                 target_file.write(chunk)
+                        record_proxy_traffic(download_bytes=downloaded_bytes)
                     downloaded += 1
             except Exception as exc:
                 failures.append(f'{index}. {type(exc).__name__}: {source_url}')
@@ -1701,11 +2019,14 @@ async def getAllCourses():
     session_cookies = dict(request.cookies)
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout, cookies=session_cookies) as session:
+        record_proxy_traffic(request_count=1)
         async with session.get(f"{TARGET_URL}/exam/api/student/teacher/entity", headers=req_headers) as res:
+            raw_body = await res.read()
+            record_proxy_traffic(download_bytes=len(raw_body))
             try:
-                teacher_payload = await res.json(content_type=None)
+                teacher_payload = json.loads(raw_body.decode(res.charset or 'utf-8'))
             except Exception:
-                raw_text = await res.text()
+                raw_text = raw_body.decode(res.charset or 'utf-8', errors='replace')
                 response = Response(
                     raw_text,
                     res.status,
@@ -1731,6 +2052,17 @@ async def getAllCourses():
 
     headers = {"content-type": "application/json"}
     return Response(json.dumps(courses), 200, headers=headers)
+
+
+@app.route('/stat')
+@app.route('/stat/')
+def stat_page():
+    return send_from_directory(os.path.join('static', 'stat'), 'index.html')
+
+
+@app.route('/stat/api')
+def stat_api():
+    return jsonify(get_stats_snapshot())
 
 
 @app.route('/')
@@ -1909,13 +2241,15 @@ async def get_statistics(entity_id):
     connector = aiohttp.TCPConnector(ssl=False)
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
     session_cookies = dict(request.cookies)
+    request_body = request.get_data()
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout, cookies=session_cookies) as session:
+        record_proxy_traffic(upload_bytes=len(request_body), request_count=1)
         async with session.request(
             method=request.method,
             url=f'{TARGET_URL}/exam/api/student/paper/entity/{entity_id}/statistics',
             headers=req_headers,
-            data=request.get_data(),
+            data=request_body,
             allow_redirects=False
         ) as resp:
             headers = filter_upstream_headers(
@@ -1923,10 +2257,12 @@ async def get_statistics(entity_id):
                 excluded=['content-encoding', 'content-length', 'transfer-encoding', 'connection']
             )
             status_code = resp.status
+            raw_body = await resp.read()
+            record_proxy_traffic(download_bytes=len(raw_body))
             try:
-                data = await resp.json(content_type=None)
+                data = json.loads(raw_body.decode(resp.charset or 'utf-8'))
             except Exception:
-                raw_text = await resp.text()
+                raw_text = raw_body.decode(resp.charset or 'utf-8', errors='replace')
                 response = Response(raw_text, status_code, headers)
                 return set_aiohttp_cookies(response, resp)
 

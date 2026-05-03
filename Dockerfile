@@ -22,5 +22,9 @@ ENV WKHTMLTOPDF_PATH=/usr/bin/wkhtmltopdf
 ENV PLAYWRIGHT_CHROMIUM_PATH=/usr/bin/chromium
 ENV PYTHONUNBUFFERED=1
 ENV PORT=7860
+ENV STAT_DB_PATH=/data/xny_stats.sqlite3
+ENV STAT_TIMEZONE=Asia/Shanghai
+
+RUN mkdir -p /data
 
 CMD gunicorn -w 2 -k gthread --threads 8 -t 120 -b 0.0.0.0:$PORT proxy:app

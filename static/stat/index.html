@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>XNY 统计</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --text: #17202a;
+      --muted: #667085;
+      --line: #d9dee7;
+      --green: #0f8b6f;
+      --blue: #2563eb;
+      --red: #c2410c;
+      --ink: #0f172a;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+      letter-spacing: 0;
+    }
+
+    .page {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 28px 0 42px;
+    }
+
+    header {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 22px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 28px;
+      line-height: 1.25;
+      color: var(--ink);
+    }
+
+    .sub {
+      margin-top: 7px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    button {
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--text);
+      min-height: 38px;
+      padding: 0 14px;
+      border-radius: 7px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    button:hover {
+      border-color: #aeb7c5;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+
+    .metric {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+      min-height: 118px;
+    }
+
+    .metric .label {
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 10px;
+    }
+
+    .metric .value {
+      font-size: 28px;
+      line-height: 1.2;
+      font-weight: 700;
+      color: var(--ink);
+      overflow-wrap: anywhere;
+    }
+
+    .metric .hint {
+      margin-top: 9px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .accent-green {
+      border-top: 4px solid var(--green);
+    }
+
+    .accent-blue {
+      border-top: 4px solid var(--blue);
+    }
+
+    .accent-red {
+      border-top: 4px solid var(--red);
+    }
+
+    .accent-ink {
+      border-top: 4px solid var(--ink);
+    }
+
+    .section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .section-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 15px 16px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .section-title {
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--ink);
+    }
+
+    .status {
+      color: var(--muted);
+      font-size: 13px;
+      text-align: right;
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 760px;
+    }
+
+    th,
+    td {
+      padding: 12px 16px;
+      border-bottom: 1px solid #edf0f5;
+      text-align: right;
+      white-space: nowrap;
+      font-size: 14px;
+    }
+
+    th:first-child,
+    td:first-child {
+      text-align: left;
+    }
+
+    th {
+      color: #475467;
+      background: #fafbfc;
+      font-weight: 600;
+    }
+
+    tbody tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .empty {
+      padding: 26px 16px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .error {
+      color: #b42318;
+    }
+
+    @media (max-width: 900px) {
+      .metrics {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 560px) {
+      .page {
+        width: min(100% - 20px, 1180px);
+        padding-top: 18px;
+      }
+
+      header {
+        align-items: stretch;
+        flex-direction: column;
+      }
+
+      h1 {
+        font-size: 24px;
+      }
+
+      .metrics {
+        grid-template-columns: 1fr;
+      }
+
+      .metric {
+        min-height: 104px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header>
+      <div>
+        <h1>网站统计</h1>
+        <div class="sub">按学号去重；流量按代理向上游发送和从上游接收的字节累计。</div>
+      </div>
+      <button id="refresh" type="button">刷新</button>
+    </header>
+
+    <section class="metrics" aria-label="总览">
+      <div class="metric accent-green">
+        <div class="label">使用人数</div>
+        <div class="value" id="uniqueStudents">--</div>
+        <div class="hint">不重复学号</div>
+      </div>
+      <div class="metric accent-blue">
+        <div class="label">总流量</div>
+        <div class="value" id="totalBytes">--</div>
+        <div class="hint" id="totalSplit">上行 -- / 下行 --</div>
+      </div>
+      <div class="metric accent-red">
+        <div class="label">今日流量</div>
+        <div class="value" id="todayBytes">--</div>
+        <div class="hint" id="todaySplit">上行 -- / 下行 --</div>
+      </div>
+      <div class="metric accent-ink">
+        <div class="label">代理请求</div>
+        <div class="value" id="totalRequests">--</div>
+        <div class="hint">发往上游的请求次数</div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <div class="section-title">每日流量</div>
+        <div class="status" id="status">加载中</div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>日期</th>
+              <th>上行</th>
+              <th>下行</th>
+              <th>合计</th>
+              <th>请求数</th>
+              <th>更新时间</th>
+            </tr>
+          </thead>
+          <tbody id="dailyRows"></tbody>
+        </table>
+        <div class="empty" id="empty" hidden>暂无统计数据</div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const els = {
+      refresh: document.getElementById('refresh'),
+      status: document.getElementById('status'),
+      uniqueStudents: document.getElementById('uniqueStudents'),
+      totalBytes: document.getElementById('totalBytes'),
+      totalSplit: document.getElementById('totalSplit'),
+      todayBytes: document.getElementById('todayBytes'),
+      todaySplit: document.getElementById('todaySplit'),
+      totalRequests: document.getElementById('totalRequests'),
+      dailyRows: document.getElementById('dailyRows'),
+      empty: document.getElementById('empty')
+    };
+
+    function formatBytes(bytes) {
+      const value = Number(bytes) || 0;
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      let size = value;
+      let unitIndex = 0;
+      while (size >= 1024 && unitIndex < units.length - 1) {
+        size /= 1024;
+        unitIndex += 1;
+      }
+      const digits = unitIndex === 0 ? 0 : size >= 100 ? 1 : 2;
+      return `${size.toFixed(digits)} ${units[unitIndex]}`;
+    }
+
+    function formatNumber(value) {
+      return new Intl.NumberFormat('zh-CN').format(Number(value) || 0);
+    }
+
+    function localDateKey() {
+      const date = new Date();
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const day = String(date.getDate()).padStart(2, '0');
+      return `${year}-${month}-${day}`;
+    }
+
+    function setStatus(text, isError) {
+      els.status.textContent = text;
+      els.status.classList.toggle('error', Boolean(isError));
+    }
+
+    function renderDaily(rows) {
+      els.dailyRows.innerHTML = '';
+      els.empty.hidden = rows.length !== 0;
+
+      for (const row of rows.slice().reverse()) {
+        const tr = document.createElement('tr');
+        const cells = [
+          row.day,
+          formatBytes(row.uploadBytes),
+          formatBytes(row.downloadBytes),
+          formatBytes(row.totalBytes),
+          formatNumber(row.requestCount),
+          row.updatedAt || ''
+        ];
+        for (const value of cells) {
+          const td = document.createElement('td');
+          td.textContent = value;
+          tr.appendChild(td);
+        }
+        els.dailyRows.appendChild(tr);
+      }
+    }
+
+    async function loadStats() {
+      setStatus('加载中', false);
+      els.refresh.disabled = true;
+      try {
+        const response = await fetch('/stat/api', { cache: 'no-store' });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const data = await response.json();
+        const daily = Array.isArray(data.daily) ? data.daily : [];
+        const today = daily.find((item) => item.day === localDateKey()) || {
+          uploadBytes: 0,
+          downloadBytes: 0,
+          totalBytes: 0
+        };
+
+        els.uniqueStudents.textContent = formatNumber(data.uniqueStudents);
+        els.totalBytes.textContent = formatBytes(data.totalBytes);
+        els.totalSplit.textContent = `上行 ${formatBytes(data.totalUploadBytes)} / 下行 ${formatBytes(data.totalDownloadBytes)}`;
+        els.todayBytes.textContent = formatBytes(today.totalBytes);
+        els.todaySplit.textContent = `上行 ${formatBytes(today.uploadBytes)} / 下行 ${formatBytes(today.downloadBytes)}`;
+        els.totalRequests.textContent = formatNumber(data.totalRequests);
+        renderDaily(daily);
+        setStatus(`更新时间 ${data.generatedAt || ''}`, false);
+      } catch (error) {
+        setStatus(`加载失败：${error.message}`, true);
+      } finally {
+        els.refresh.disabled = false;
+      }
+    }
+
+    els.refresh.addEventListener('click', loadStats);
+    loadStats();
+  </script>
+</body>
+</html>
