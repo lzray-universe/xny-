@@ -1860,10 +1860,7 @@ def downloadBundle():
         return jsonify({'message': 'No files were provided for bundling.'}), 400
 
     bundle_name = sanitize_download_name(_parse.unquote(str(payload.get('name') or 'page-files')), 'page-files')
-    request_headers = {
-        key: value for key, value in request.headers
-        if key.lower() not in {'host', 'content-length', 'content-type'}
-    }
+    request_headers = get_request_headers({'host', 'content-length', 'content-type', 'accept-encoding'})
 
     zip_buffer = io.BytesIO()
     used_names = set()
