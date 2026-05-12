@@ -19,4 +19,4 @@ if len(sys.argv) > 1:
 else:
     port = int(os.environ.get('PORT', '18080'))
 
-proxy.app.run(host='127.0.0.1', port=port, debug=False)
+proxy.app.run(host='0.0.0.0', port=port, debug=False)

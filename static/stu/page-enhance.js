@@ -769,9 +769,14 @@
       vm &&
         vm.data &&
         typeof vm.data === "object" &&
-        vm.data.id != null &&
-        (vm.data.courseId != null || vm.data.paperId != null) &&
-        (typeof vm.openWriteModal === "function" || typeof vm.CropperFinish === "function")
+        (vm.data.id != null || vm.data.questionId != null) &&
+        (vm.data.courseId != null || vm.data.paperId != null || vm.data.dataId != null) &&
+        (
+          typeof vm.openWriteModal === "function" ||
+          typeof vm.CropperFinish === "function" ||
+          vm.data.questionStem != null ||
+          vm.data.questionNumber != null
+        )
     );
 
   const findQuestionVm = (startNode) => {
@@ -802,9 +807,20 @@
       return null;
     }
 
-    const entityType = vm.data.courseId != null ? "course" : vm.data.paperId != null ? "paper" : "";
-    const entityId = Number(vm.data.courseId != null ? vm.data.courseId : vm.data.paperId);
-    const questionId = Number(vm.data.id);
+    const entityType =
+      vm.data.courseId != null || vm.data.dataType === 0
+        ? "course"
+        : vm.data.paperId != null || vm.data.dataType === 1
+          ? "paper"
+          : "";
+    const entityId = Number(
+      vm.data.courseId != null
+        ? vm.data.courseId
+        : vm.data.paperId != null
+          ? vm.data.paperId
+          : vm.data.dataId
+    );
+    const questionId = Number(vm.data.id != null ? vm.data.id : vm.data.questionId);
     if (!entityType || !entityId || !questionId) {
       return null;
     }
@@ -2343,4 +2359,824 @@
     },
     true
   );
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  EXAM ENHANCEMENTS: Answer viewing, Excel download, Statistics
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const ENHANCED_EXAM_OBSERVER_INTERVAL = 1200;
+  let examEnhanceTimer = 0;
+  let currentPaperId = null;
+  let currentCatalogId = null;
+  let currentOpenScore = 0;
+  let currentExamPublished = null;
+  const paperListCache = new Map();
+  const answerCache = new Map();
+  const publishStateCache = new Map();
+  const EXAM_TOP_COLLAPSE_KEY = "page-exam-top-collapsed";
+
+  const isExamPage = () => {
+    const hash = window.location.hash || "";
+    return hash.includes("/exam");
+  };
+
+  const getExamRouteParams = () => {
+    const hash = (window.location.hash || "").split("?")[1] || "";
+    const params = {};
+    hash.split("&").forEach((pair) => {
+      const [key, value] = pair.split("=");
+      if (key) params[decodeURIComponent(key)] = decodeURIComponent(value || "");
+    });
+    return params;
+  };
+
+  const findExamPaperId = () => {
+    // Always get catalogId from URL (most reliable)
+    const params = getExamRouteParams();
+    const urlCatalogId = params.catalogId ? parseInt(params.catalogId) : null;
+
+    // Try to get paperId from the Vue component tree
+    const appRoot = document.getElementById("app");
+    let paperId = null;
+    let catalogId = urlCatalogId;
+    let openScore = 0;
+    let paperName = "";
+
+    if (appRoot && appRoot.__vue__) {
+      const walk = (vm, depth) => {
+        if (!vm || depth > 20) return;
+        const candidates = [vm, vm.data, vm.info, vm.paperInfo, vm.paperCatalogInfo].filter(Boolean);
+        for (const item of candidates) {
+          if (paperId == null && item.paperId != null) {
+            paperId = item.paperId;
+          } else if (
+            paperId == null &&
+            item.id != null &&
+            (item.catalogId != null || item.paperName != null || item.paperFinishTag != null || item.openScore != null)
+          ) {
+            paperId = item.id;
+          }
+          if (catalogId == null && item.catalogId != null) {
+            catalogId = item.catalogId;
+          }
+          if (item.openScore != null) {
+            openScore = Number(item.openScore);
+          }
+          if (!paperName && (item.paperName || item.name || item.title)) {
+            paperName = item.paperName || item.name || item.title;
+          }
+        }
+        if (vm.$children) {
+          for (const child of vm.$children) {
+            walk(child, depth + 1);
+          }
+        }
+      };
+      walk(appRoot.__vue__, 0);
+    }
+
+    return {
+      paperId: paperId ? Number(paperId) : null,
+      catalogId: catalogId ? Number(catalogId) : null,
+      openScore: openScore,
+      paperName: paperName
+    };
+  };
+
+  const fetchPaperList = async (catalogId) => {
+    if (!catalogId) return null;
+    if (paperListCache.has(catalogId)) return paperListCache.get(catalogId);
+    try {
+      const resp = await fetch(`/exam/api/student/paper/entity/catalog/${catalogId}?t=${Date.now()}`);
+      const data = await resp.json();
+      if (data.code === 0 && data.extra && data.extra.length > 0) {
+        const first = data.extra[0];
+        const paper = {
+          id: Number(first.id || first.paperId),
+          name: first.paperName || first.name || "",
+          openScore: Number(first.openScore || first.openScoreTag || 0)
+        };
+        paperListCache.set(catalogId, paper);
+        return paper;
+      }
+    } catch (e) {
+      // ignore and try the paper/list endpoint below
+    }
+    try {
+      const resp = await fetch(`/exam/api/paper/list/${catalogId}?t=${Date.now()}`);
+      const data = await resp.json();
+      if (data.code === 0 && data.extra && data.extra.length > 0) {
+        const first = data.extra[0];
+        const paper = {
+          id: Number(first.id || first.paperId),
+          name: first.paperName || first.name || "",
+          openScore: Number(first.openScore || first.openScoreTag || 0)
+        };
+        paperListCache.set(catalogId, paper);
+        return paper;
+      }
+    } catch (e) {
+      // ignore
+    }
+    return null;
+  };
+
+  const fetchTeacherAnswers = async (paperId) => {
+    if (answerCache.has(paperId)) return answerCache.get(paperId);
+    try {
+      const resp = await fetch(`/exam/api/paper/content/${paperId}?t=${Date.now()}`);
+      const data = await resp.json();
+      answerCache.set(paperId, data);
+      return data;
+    } catch (e) {
+      return null;
+    }
+  };
+
+  const getCurrentStudentKeys = () => {
+    const keys = { id: "", name: "", username: "" };
+    try {
+      const info = JSON.parse(sessionStorage.getItem("course_userInfo") || "{}");
+      keys.id = String(info.number || info.studentId || info.userId || "").trim();
+      keys.name = String(info.userName || info.name || "").trim();
+    } catch (e) {
+      // ignore
+    }
+    keys.username = String(localStorage.getItem("username") || "").trim();
+    return keys;
+  };
+
+  const fetchExamPublishState = async (paperId, catalogId) => {
+    const cacheKey = `${paperId}:${catalogId || ""}`;
+    if (publishStateCache.has(cacheKey)) return publishStateCache.get(cacheKey);
+    try {
+      const query = catalogId ? `?catalogId=${encodeURIComponent(catalogId)}&t=${Date.now()}` : `?t=${Date.now()}`;
+      const resp = await fetch(`/exam/api/student/paper/entity/${paperId}/statistics${query}`);
+      const data = await resp.json();
+      const extra = data.extra || {};
+      const marker = `${extra.scoring || ""} ${extra.scoringTotal || ""} ${data.message || ""}`;
+      const hasPublishedLists =
+        Array.isArray(extra.paperStudentScoreList) && extra.paperStudentScoreList.length > 0;
+      const hasNumericOwnScore =
+        extra.scoring != null &&
+        String(extra.scoring).trim() !== "" &&
+        Number.isFinite(Number(extra.scoring));
+      const hasNumericTotal =
+        extra.scoringTotal != null &&
+        String(extra.scoringTotal).trim() !== "" &&
+        Number.isFinite(Number(extra.scoringTotal)) &&
+        Number(extra.scoringTotal) > 0;
+      const isUnpublishedMarker = /unpublished|未发布|暂无|没有权限|未开放/i.test(marker);
+      const published = data.code === 0 && !isUnpublishedMarker && (
+        hasPublishedLists ||
+        (hasNumericOwnScore && hasNumericTotal) ||
+        Number(extra.openScore || currentOpenScore || 0) === 1
+      );
+      publishStateCache.set(cacheKey, published);
+      return published;
+    } catch (e) {
+      publishStateCache.set(cacheKey, false);
+      return false;
+    }
+  };
+
+  const flattenAnswerItems = (items, answerMap) => {
+    (items || []).forEach((item) => {
+      const q = item && (item.content || item);
+      if (!q || typeof q !== "object") return;
+      const info = {
+        answer: q.answer || "",
+        analysis: q.questionAnalysis || "",
+        questionNumber: q.questionNumber || "",
+        questionStem: q.questionStem || "",
+      };
+      if (q.id != null) answerMap[String(q.id)] = info;
+      if (q.questionId != null) answerMap[String(q.questionId)] = info;
+      if (q.questionNumber != null) answerMap[`n:${q.questionNumber}`] = info;
+      if (Array.isArray(q.childList)) flattenAnswerItems(q.childList, answerMap);
+      if (Array.isArray(q.children)) flattenAnswerItems(q.children, answerMap);
+    });
+  };
+
+  const ensureQuestionActionHost = (container) => {
+    let host = container.querySelector(".page-exam-question-actions");
+    if (host) return host;
+    host = document.createElement("div");
+    host.className = "page-exam-question-actions";
+    container.classList.add("page-exam-question-host");
+    const tagBox = container.querySelector(".tagBox .flex, .tagBox, .itemContent");
+    if (tagBox) {
+      tagBox.insertAdjacentElement("afterend", host);
+    } else {
+      container.insertBefore(host, container.firstChild);
+    }
+    return host;
+  };
+
+  const getQuestionNumberFromContainer = (container, fallback) => {
+    const text = String((container && container.innerText) || "");
+    const match = text.match(/题号[:：]?\s*([0-9][^\s，,。；;：:]*)/);
+    return match ? match[1] : (fallback != null ? String(fallback) : "");
+  };
+
+  const getExamQuestionContext = (container) => {
+    const vm = findQuestionVm(container);
+    const context = getQuestionContext(vm);
+    const questionNumber = getQuestionNumberFromContainer(container, context && context.questionNumber);
+    if (!questionNumber || !/^\d/.test(questionNumber)) return null;
+    if (!context || context.entityType !== "paper") {
+      const fallbackId = parseInt(questionNumber, 10) || 0;
+      return {
+        entityType: "paper",
+        entityId: currentPaperId,
+        questionId: fallbackId,
+        questionNumber,
+        key: `paper:${currentPaperId}:${questionNumber}`
+      };
+    }
+    return {
+      ...context,
+      questionNumber
+    };
+  };
+
+  const findExamActionHost = () => {
+    const selectors = [
+      ".content .paperContent",
+      ".paperContent",
+      ".content .paper-box",
+      ".content .quesContent",
+      ".content",
+      "#app"
+    ];
+    for (const selector of selectors) {
+      const node = document.querySelector(selector);
+      if (node && isVisible(node)) return node.closest(".content") || node.parentElement || node;
+    }
+    return null;
+  };
+
+  const findExamNativeTop = () => {
+    const candidates = [...document.querySelectorAll(".top")];
+    return candidates.find((node) => {
+      const text = (node.innerText || "").replace(/\s+/g, "");
+      return isVisible(node) && /筛选|下载本页|获取选择题作答情况|下载答案解析|扫一扫传答案/.test(text);
+    }) || null;
+  };
+
+  const findExamBlankPaper = (top) => {
+    if (!top || !top.parentElement) return null;
+    return top.parentElement.querySelector(".blankPaper");
+  };
+
+  const setExamTopCollapsed = (top, collapsed) => {
+    if (!top) return;
+    top.classList.toggle("page-exam-top-collapsed", collapsed);
+    const button = top.querySelector(".page-exam-top-toggle");
+    if (button) button.textContent = collapsed ? "展开工具区" : "收起工具区";
+    const blank = findExamBlankPaper(top);
+    if (blank) {
+      if (!blank.dataset.pageOriginalHeight) {
+        blank.dataset.pageOriginalHeight = blank.style.height || "";
+      }
+      blank.style.height = collapsed ? "0px" : blank.dataset.pageOriginalHeight;
+    }
+    window.localStorage.setItem(EXAM_TOP_COLLAPSE_KEY, collapsed ? "1" : "0");
+  };
+
+  const ensureExamTopCollapseButton = () => {
+    if (!isExamPage()) return;
+    const top = findExamNativeTop();
+    if (!top) return;
+    let button = top.querySelector(".page-exam-top-toggle");
+    if (!button) {
+      button = document.createElement("button");
+      button.type = "button";
+      button.className = "ant-btn page-exam-top-toggle";
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        setExamTopCollapsed(top, !top.classList.contains("page-exam-top-collapsed"));
+      });
+      top.insertBefore(button, top.firstChild);
+    }
+    setExamTopCollapsed(top, window.localStorage.getItem(EXAM_TOP_COLLAPSE_KEY) === "1");
+  };
+
+  // ── Answer Button per Question ──────────────────────────────────────
+
+  const ANSWER_BUTTON_CLASS = "page-exam-answer-btn";
+  const ANSWER_PANEL_CLASS = "page-exam-answer-panel";
+  const STATS_BTN_CLASS = "page-exam-stats-btn";
+  const QSTATS_BTN_CLASS = "page-exam-qstats-btn";
+
+  const closeAllAnswerPanels = () => {
+    document.querySelectorAll(`.${ANSWER_PANEL_CLASS}`).forEach((p) => p.remove());
+  };
+
+  const showAnswerModal = (questionData, standardAnswer, questionAnalysis) => {
+    closeAllAnswerPanels();
+    const overlay = document.createElement("div");
+    overlay.className = "page-exam-overlay";
+    overlay.innerHTML = `
+      <div class="page-exam-modal">
+        <div class="page-exam-modal__head">
+          <div>
+            <div class="page-exam-modal__title">标准答案</div>
+            <div class="page-exam-modal__meta">题号 ${questionData.questionNumber || questionData.id}</div>
+          </div>
+          <button type="button" class="page-exam-modal__close">&times;</button>
+        </div>
+        <div class="page-exam-modal__body">
+          <div class="page-exam-answer-content">${standardAnswer || '<em>暂无标准答案</em>'}</div>
+          ${questionAnalysis ? `<div class="page-exam-analysis"><strong>解析：</strong>${questionAnalysis}</div>` : ""}
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    overlay.querySelector(".page-exam-modal__close").addEventListener("click", () => overlay.remove());
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
+    document.addEventListener("keydown", function escHandler(e) {
+      if (e.key === "Escape") { overlay.remove(); document.removeEventListener("keydown", escHandler); }
+    });
+  };
+
+  const addAnswerButtons = async () => {
+    if (!isExamPage()) return;
+
+    const examInfo = findExamPaperId();
+    let paperId = examInfo.paperId;
+    const catalogId = examInfo.catalogId;
+
+    if (!paperId && catalogId) {
+      const paper = await fetchPaperList(catalogId);
+      if (paper && paper.id) {
+        paperId = paper.id;
+        currentOpenScore = paper.openScore;
+        if (paper.name) localStorage.setItem("paperName", paper.name);
+      }
+    }
+    if (!paperId) return;
+    currentPaperId = paperId;
+    currentCatalogId = catalogId;
+    currentOpenScore = examInfo.openScore || currentOpenScore;
+    if (examInfo.paperName) localStorage.setItem("paperName", examInfo.paperName);
+
+    // Fetch all answers once and cache
+    const answerData = await fetchTeacherAnswers(paperId);
+    let answerMap = {};
+    if (answerData && answerData.extra) {
+      flattenAnswerItems(answerData.extra || [], answerMap);
+    }
+
+    // Find all question containers and add answer buttons
+    const questionContainers = document.querySelectorAll(".quesContent, .question-box");
+    questionContainers.forEach((container) => {
+      if (!isVisible(container)) return;
+      if (container.querySelector(`.${ANSWER_BUTTON_CLASS}`)) return;
+
+      const context = getExamQuestionContext(container);
+      if (!context) return;
+
+      const answerInfo = answerMap[String(context.questionId)] || answerMap[`n:${context.questionNumber}`];
+      if (!answerInfo) return;
+
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `ant-btn ${ANSWER_BUTTON_CLASS}`;
+      btn.style.cssText = "margin-left:6px;font-size:12px;padding:0 8px;height:26px;line-height:24px;";
+      btn.textContent = "查看答案";
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        showAnswerModal(
+          { id: context.questionId, questionNumber: answerInfo.questionNumber },
+          answerInfo.answer,
+          answerInfo.analysis
+        );
+      });
+
+      ensureQuestionActionHost(container).appendChild(btn);
+    });
+  };
+
+  const buildStatsModal = (statsData, paperName) => {
+    const s = statsData;
+    const o = s.overall || {};
+    const d = s.scoreDistribution || {};
+
+    // Build score distribution bar chart
+    let distBars = "";
+    if (d.distribution && d.distribution.length > 0) {
+      const maxCount = Math.max(...d.distribution);
+      distBars = d.distribution.map((count, i) => {
+        const pct = maxCount > 0 ? Math.round((count / maxCount) * 100) : 0;
+        const label = d.labels ? d.labels[i] : `段${i + 1}`;
+        return `<div class="page-stats-bar-row">
+          <span class="page-stats-bar-label">${label}</span>
+          <div class="page-stats-bar-track"><div class="page-stats-bar-fill" style="width:${pct}%"></div></div>
+          <span class="page-stats-bar-count">${count}人</span>
+        </div>`;
+      }).join("");
+    }
+
+    const modeDisplay = o.mode && Array.isArray(o.mode) ? o.mode.join(", ") : (o.mode || "无");
+
+    const html = `
+      <div class="page-exam-overlay" id="page-stats-overlay">
+        <div class="page-exam-modal page-exam-stats-modal">
+          <div class="page-exam-modal__head">
+            <div>
+              <div class="page-exam-modal__title">${paperName || "考试"} 详细信息</div>
+              <div class="page-exam-modal__meta">
+                有效学生: ${s.studentCount} 人 (总${s.totalStudentCount}人, 剔除${s.filteredCount}人全零分) · 题目: ${s.questionCount} 题
+              </div>
+            </div>
+            <button type="button" class="page-exam-modal__close" onclick="document.getElementById('page-stats-overlay').remove()">&times;</button>
+          </div>
+          <div class="page-exam-modal__body page-stats-body">
+            <div class="page-stats-grid">
+              <div class="page-stats-card">
+                <div class="page-stats-card__title">基本统计</div>
+                <table class="page-stats-table">
+                  <tr><td>你的排名</td><td><strong>${s.studentRank != null ? `${s.studentRank} / ${s.studentCount}` : "-"}</strong></td></tr>
+                  <tr><td>你的分数</td><td><strong>${s.studentTotal != null ? s.studentTotal : "-"}</strong></td></tr>
+                  <tr><td>平均数</td><td><strong>${o.mean != null ? o.mean : "-"}</strong></td></tr>
+                  <tr><td>中位数</td><td><strong>${o.median != null ? o.median : "-"}</strong></td></tr>
+                  <tr><td>最高分</td><td><strong>${o.max != null ? o.max : "-"}</strong></td></tr>
+                  <tr><td>最低分</td><td><strong>${o.min != null ? o.min : "-"}</strong></td></tr>
+                  <tr><td>全距</td><td><strong>${o.range != null ? o.range : "-"}</strong></td></tr>
+                  <tr><td>众数</td><td><strong>${modeDisplay}</strong></td></tr>
+                </table>
+              </div>
+              <div class="page-stats-card">
+                <div class="page-stats-card__title">分布特征</div>
+                <table class="page-stats-table">
+                  <tr><td>Q1 (25%)</td><td><strong>${o.q1 != null ? o.q1 : "-"}</strong></td></tr>
+                  <tr><td>Q3 (75%)</td><td><strong>${o.q3 != null ? o.q3 : "-"}</strong></td></tr>
+                  <tr><td>四分位距 IQR</td><td><strong>${o.iqr != null ? o.iqr : "-"}</strong></td></tr>
+                  <tr><td>偏度</td><td><strong>${o.skewness != null ? o.skewness : "-"}</strong></td></tr>
+                  <tr><td>峰度</td><td><strong>${o.kurtosis != null ? o.kurtosis : "-"}</strong></td></tr>
+                  <tr><td>标准差</td><td><strong>${o.std != null ? o.std : "-"}</strong></td></tr>
+                </table>
+              </div>
+              <div class="page-stats-card">
+                <div class="page-stats-card__title">试卷质量</div>
+                <table class="page-stats-table">
+                  <tr><td>克隆巴赫 α</td><td><strong>${s.cronbachAlpha != null ? s.cronbachAlpha : "-"}</strong></td></tr>
+                  <tr><td>试卷总区分度</td><td><strong>${s.paperDiscrimination != null ? s.paperDiscrimination : "-"}</strong></td></tr>
+                  <tr><td>题目数</td><td><strong>${s.questionCount}</strong></td></tr>
+                </table>
+              </div>
+            </div>
+            <div class="page-stats-card" style="grid-column:1/-1;">
+              <div class="page-stats-card__title">分数段分布 (按总分的1/${Math.max(1, d.segments || 20)} 分段)</div>
+              <div class="page-stats-dist">${distBars || "<em>暂无数据</em>"}</div>
+            </div>
+            <div class="page-stats-card" style="grid-column:1/-1;">
+              <div class="page-stats-card__title">所有人成绩 (匿名，仅分数)</div>
+              <div class="page-stats-scores">${(s.allScores || []).slice(0, 50).map(r => `<span class="page-stats-score-chip">#${r.rank} ${r.score}</span>`).join(" ")}${(s.allScores || []).length > 50 ? `<br><em>... 共${s.allScores.length}人，仅显示前50名</em>` : ""}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+    return html;
+  };
+
+  const addExamStatsButton = async () => {
+    if (!isExamPage()) return;
+
+    const paperId = currentPaperId;
+    if (!paperId) return;
+
+    const contentArea = findExamActionHost();
+    if (!contentArea) return;
+
+    let targetArea = document.querySelector(".page-exam-action-bar");
+    if (!targetArea) {
+      targetArea = document.createElement("div");
+      targetArea.className = "page-exam-action-bar";
+      contentArea.insertBefore(targetArea, contentArea.firstChild);
+    }
+
+    if (targetArea.querySelector(`.${STATS_BTN_CLASS}`)) return;
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `ant-btn ant-btn-primary ${STATS_BTN_CLASS}`;
+    btn.textContent = "本次考试详细信息";
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      btn.textContent = "加载中...";
+      try {
+        const published = await fetchExamPublishState(paperId, currentCatalogId);
+        currentExamPublished = published;
+        if (published !== true) {
+          alert("成绩未发布：当前只替换页面最高分和平均分，不生成详细统计。");
+          return;
+        }
+        const keys = getCurrentStudentKeys();
+        const query = new URLSearchParams({
+          t: String(Date.now()),
+          catalogId: String(currentCatalogId || ""),
+          studentKey: keys.username || keys.id || "",
+          studentName: keys.name || ""
+        });
+        const resp = await fetch(`/exam/api/enhanced/statistics/${paperId}?${query.toString()}`);
+        const data = await resp.json();
+        if (data.code === 0 && data.extra && data.extra.studentCount > 0) {
+          const paperName = localStorage.getItem("paperName") || "考试";
+          const modalHtml = buildStatsModal(data.extra, paperName);
+          document.body.insertAdjacentHTML("beforeend", modalHtml);
+          const overlay = document.getElementById("page-stats-overlay");
+          if (overlay) {
+            overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
+            document.addEventListener("keydown", function escHandler(e) {
+              if (e.key === "Escape") { overlay.remove(); document.removeEventListener("keydown", escHandler); }
+            });
+          }
+        } else {
+          alert("暂无有效统计数据（可能成绩未发布或无有效学生数据）。");
+        }
+      } catch (e) {
+        alert("获取统计信息失败: " + (e.message || "网络错误"));
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "本次考试详细信息";
+      }
+    });
+    targetArea.appendChild(btn);
+  };
+
+  // ── Per-Question Stats Button ──────────────────────────────────────
+
+  const buildQuestionStatsModal = (qStats) => {
+    const s = qStats;
+    const st = s.stats || {};
+    const d = s.scoreDistribution || {};
+    const modeDisplay = st.mode && Array.isArray(st.mode) ? st.mode.join(", ") : (st.mode || "无");
+
+    let distBars = "";
+    if (d.distribution && d.distribution.length > 0) {
+      const maxCount = Math.max(...d.distribution);
+      distBars = d.distribution.map((count, i) => {
+        const pct = maxCount > 0 ? Math.round((count / maxCount) * 100) : 0;
+        const label = d.labels ? d.labels[i] : `段${i + 1}`;
+        return `<div class="page-stats-bar-row">
+          <span class="page-stats-bar-label">${label}</span>
+          <div class="page-stats-bar-track"><div class="page-stats-bar-fill" style="width:${pct}%"></div></div>
+          <span class="page-stats-bar-count">${count}人</span>
+        </div>`;
+      }).join("");
+    }
+
+    const uniqueId = "page-qstats-" + Date.now();
+    return `
+      <div class="page-exam-overlay" id="${uniqueId}">
+        <div class="page-exam-modal page-exam-stats-modal">
+          <div class="page-exam-modal__head">
+            <div>
+              <div class="page-exam-modal__title">题号 ${s.questionNumber} 详细信息</div>
+              <div class="page-exam-modal__meta">
+                满分: ${s.scoreMax} · 学生数: ${s.studentCount} · 区分度: ${s.discrimination != null ? s.discrimination : "-"}
+              </div>
+            </div>
+            <button type="button" class="page-exam-modal__close" onclick="document.getElementById('${uniqueId}').remove()">&times;</button>
+          </div>
+          <div class="page-exam-modal__body page-stats-body">
+            <div class="page-stats-grid">
+              <div class="page-stats-card">
+                <div class="page-stats-card__title">基本统计</div>
+                <table class="page-stats-table">
+                  <tr><td>平均数</td><td><strong>${st.mean != null ? st.mean : "-"}</strong></td></tr>
+                  <tr><td>中位数</td><td><strong>${st.median != null ? st.median : "-"}</strong></td></tr>
+                  <tr><td>最高分</td><td><strong>${st.max != null ? st.max : "-"}</strong></td></tr>
+                  <tr><td>最低分</td><td><strong>${st.min != null ? st.min : "-"}</strong></td></tr>
+                  <tr><td>全距</td><td><strong>${st.range != null ? st.range : "-"}</strong></td></tr>
+                  <tr><td>众数</td><td><strong>${modeDisplay}</strong></td></tr>
+                </table>
+              </div>
+              <div class="page-stats-card">
+                <div class="page-stats-card__title">分布特征</div>
+                <table class="page-stats-table">
+                  <tr><td>Q1 (25%)</td><td><strong>${st.q1 != null ? st.q1 : "-"}</strong></td></tr>
+                  <tr><td>Q3 (75%)</td><td><strong>${st.q3 != null ? st.q3 : "-"}</strong></td></tr>
+                  <tr><td>四分位距 IQR</td><td><strong>${st.iqr != null ? st.iqr : "-"}</strong></td></tr>
+                  <tr><td>偏度</td><td><strong>${st.skewness != null ? st.skewness : "-"}</strong></td></tr>
+                  <tr><td>峰度</td><td><strong>${st.kurtosis != null ? st.kurtosis : "-"}</strong></td></tr>
+                  <tr><td>区分度</td><td><strong>${s.discrimination != null ? s.discrimination : "-"}</strong></td></tr>
+                </table>
+              </div>
+              <div class="page-stats-card">
+                <div class="page-stats-card__title">信度对比</div>
+                <table class="page-stats-table">
+                  <tr><td>全卷克隆巴赫 α</td><td><strong>${s.cronbachAlphaFull != null ? s.cronbachAlphaFull : "-"}</strong></td></tr>
+                  <tr><td>去除本题后 α</td><td><strong>${s.cronbachAlphaWithout != null ? s.cronbachAlphaWithout : "-"}</strong></td></tr>
+                  <tr><td>变化</td><td><strong>${s.cronbachAlphaFull != null && s.cronbachAlphaWithout != null ? (s.cronbachAlphaWithout - s.cronbachAlphaFull).toFixed(6) : "-"}</strong></td></tr>
+                </table>
+              </div>
+            </div>
+            <div class="page-stats-card" style="grid-column:1/-1;">
+              <div class="page-stats-card__title">分数分布 (只统计有分的分数)</div>
+              <div class="page-stats-dist">${distBars || "<em>暂无数据</em>"}</div>
+            </div>
+            <div class="page-stats-card" style="grid-column:1/-1;">
+              <div class="page-stats-card__title">所有人成绩 (匿名)</div>
+              <div class="page-stats-scores">${(s.allScores || []).slice(0, 50).map(r => `<span class="page-stats-score-chip">#${r.rank} ${r.score}</span>`).join(" ")}${(s.allScores || []).length > 50 ? `<br><em>... 共${s.allScores.length}人，仅显示前50名</em>` : ""}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  };
+
+  const addPerQuestionStatsButtons = async () => {
+    if (!isExamPage()) return;
+
+    const paperId = currentPaperId;
+    if (!paperId) return;
+    if (!currentExamPublished) return;
+
+    const questionContainers = document.querySelectorAll(".quesContent, .question-box");
+    if (questionContainers.length === 0) return;
+
+    questionContainers.forEach((container) => {
+      if (!isVisible(container)) return;
+      if (container.querySelector(`.${QSTATS_BTN_CLASS}`)) return;
+
+      const context = getExamQuestionContext(container);
+      if (!context) return;
+
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `ant-btn ${QSTATS_BTN_CLASS}`;
+      btn.style.cssText = "margin-left:4px;font-size:11px;padding:0 6px;height:24px;line-height:22px;background:#f0fdfa;color:#0d9488;border:1px solid rgba(13,148,136,0.3);";
+      btn.textContent = "单题统计";
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        btn.disabled = true;
+        btn.textContent = "加载...";
+        try {
+          const query = new URLSearchParams({
+            t: String(Date.now()),
+            catalogId: String(currentCatalogId || ""),
+            questionNumber: String(context.questionNumber || "")
+          });
+          const resp = await fetch(`/exam/api/enhanced/statistics/${paperId}/question/${context.questionId}?${query.toString()}`);
+          const data = await resp.json();
+          if (data.code === 0 && data.extra) {
+            const modalHtml = buildQuestionStatsModal(data.extra);
+            document.body.insertAdjacentHTML("beforeend", modalHtml);
+          } else {
+            alert(data.message || "获取题目统计失败");
+          }
+        } catch (err) {
+          alert("获取题目统计失败: " + (err.message || "网络错误"));
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "单题统计";
+        }
+      });
+
+      ensureQuestionActionHost(container).appendChild(btn);
+    });
+  };
+
+  // ── Cleanup ────────────────────────────────────────────────────────
+
+  const removeExamEnhancements = () => {
+    document.querySelectorAll(`.${ANSWER_BUTTON_CLASS}`).forEach(b => b.remove());
+    document.querySelectorAll(`.${STATS_BTN_CLASS}`).forEach(b => b.remove());
+    document.querySelectorAll(`.${QSTATS_BTN_CLASS}`).forEach(b => b.remove());
+    document.querySelectorAll('.page-exam-action-bar').forEach(b => b.remove());
+    document.querySelectorAll('.top').forEach((top) => {
+      const blank = findExamBlankPaper(top);
+      if (blank && blank.dataset.pageOriginalHeight != null) {
+        blank.style.height = blank.dataset.pageOriginalHeight;
+      }
+    });
+    document.querySelectorAll('.page-exam-top-toggle').forEach(b => b.remove());
+    document.querySelectorAll('.page-exam-top-collapsed').forEach(b => b.classList.remove('page-exam-top-collapsed'));
+    document.querySelectorAll('.page-exam-overlay').forEach(o => o.remove());
+  };
+
+  // ── Master Exam Enhance Scheduler ──────────────────────────────────
+
+  let examEnhanceBusy = false;
+
+  const scheduleExamEnhance = (delay = 450) => {
+    window.clearTimeout(examEnhanceTimer);
+    examEnhanceTimer = window.setTimeout(async () => {
+      if (!isExamPage()) {
+        removeExamEnhancements();
+        examEnhanceBusy = false;
+        return;
+      }
+      if (examEnhanceBusy) return;
+      examEnhanceBusy = true;
+
+      try {
+        // Always get fresh catalogId from URL
+        const params = getExamRouteParams();
+        const newCatalogId = params.catalogId ? parseInt(params.catalogId) : null;
+
+        // Get paperId from Vue
+        const examInfo = findExamPaperId();
+        let newPaperId = examInfo.paperId;
+        if (examInfo.openScore) currentOpenScore = examInfo.openScore;
+        if (examInfo.paperName) localStorage.setItem("paperName", examInfo.paperName);
+        if (!newPaperId && newCatalogId) {
+          const paper = await fetchPaperList(newCatalogId);
+          if (paper && paper.id) {
+            newPaperId = paper.id;
+            currentOpenScore = paper.openScore;
+            if (paper.name) localStorage.setItem("paperName", paper.name);
+          }
+        }
+
+        // If catalogId or paperId changed, reset
+        const needsRefresh = (newCatalogId && newCatalogId !== currentCatalogId) ||
+                             (newPaperId && newPaperId !== currentPaperId);
+
+        if (needsRefresh) {
+          currentCatalogId = newCatalogId;
+          currentPaperId = newPaperId;
+          currentExamPublished = null;
+          removeExamEnhancements();
+        }
+
+        if (!currentCatalogId) { examEnhanceBusy = false; return; }
+
+        // Get paperId if needed
+        if (!currentPaperId) {
+          currentPaperId = newPaperId;
+          if (!currentPaperId && currentCatalogId) {
+            const paper = await fetchPaperList(currentCatalogId);
+            currentPaperId = paper && paper.id;
+            if (paper && paper.name) localStorage.setItem("paperName", paper.name);
+          }
+        }
+
+        if (!currentPaperId) { examEnhanceBusy = false; return; }
+
+        if (currentExamPublished == null) {
+          currentExamPublished = await fetchExamPublishState(currentPaperId, currentCatalogId);
+        }
+
+        ensureExamTopCollapseButton();
+        await addAnswerButtons();
+        await addExamStatsButton();
+        await addPerQuestionStatsButtons();
+      } finally {
+        setTimeout(() => { examEnhanceBusy = false; }, 250);
+      }
+    }, delay);
+  };
+
+  // Watch for hash changes
+  const origHashChangeHandler = window.onhashchange;
+  window.addEventListener("hashchange", () => {
+    if (typeof origHashChangeHandler === "function") origHashChangeHandler();
+    currentPaperId = null;
+    currentCatalogId = null;
+    currentOpenScore = 0;
+    examEnhanceBusy = false;
+    removeExamEnhancements();
+    scheduleExamEnhance(1500);
+  });
+
+  // Watch for page loads
+  window.addEventListener("load", () => {
+    scheduleExamEnhance(2000);
+  });
+
+  const examDomObserver = new MutationObserver(() => {
+    if (isExamPage()) scheduleExamEnhance(250);
+  });
+  examDomObserver.observe(document.documentElement, {
+    childList: true,
+    subtree: true
+  });
+
+  document.addEventListener(
+    "click",
+    () => {
+      if (isExamPage()) scheduleExamEnhance(350);
+    },
+    true
+  );
+
+  // Initial trigger
+  scheduleExamEnhance(1500);
+
+  // Periodic check for paperId changes (swiper navigation)
+  setInterval(() => {
+    if (!isExamPage() || examEnhanceBusy) return;
+    const examInfo = findExamPaperId();
+    if (examInfo.paperId && examInfo.paperId !== currentPaperId) {
+      currentPaperId = null; // force re-fetch
+      removeExamEnhancements();
+      scheduleExamEnhance(500);
+    }
+  }, 2000);
 })();

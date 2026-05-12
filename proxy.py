@@ -7,6 +7,7 @@ import hashlib
 import shutil
 import io
 import zipfile
+import openpyxl
 import threading
 import atexit
 import queue
@@ -22,7 +23,12 @@ from requests.adapters import HTTPAdapter
 import time
 import os
 import mimetypes
-import pdfkit
+try:
+    import pdfkit
+    PDFKIT_AVAILABLE = True
+except ImportError:
+    pdfkit = None
+    PDFKIT_AVAILABLE = False
 import aiohttp
 import asyncio
 import tempfile
@@ -30,7 +36,12 @@ import markdown
 from urllib import parse
 from urllib import parse as _parse
 from Crypto.Cipher import AES
-from playwright.sync_api import sync_playwright
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    sync_playwright = None
+    PLAYWRIGHT_AVAILABLE = False
 from flask import Flask, request, Response, redirect, send_from_directory, make_response, jsonify
 
 TARGET_URL = os.environ.get('TARGET_URL', 'https://bdfz.xnykcxt.com:5002')
@@ -48,7 +59,508 @@ STATS_TIMEZONE_NAME = os.environ.get('STAT_TIMEZONE', 'Asia/Shanghai')
 app = Flask(__name__)
 ATTACHMENT_KEY = os.environ.get('ATTACHMENT_AES_KEY', '348ebfa6d1f9708310cb8a7f88367bc5').encode('utf-8')
 ATTACHMENT_PATH_RE = re.compile(r'^[A-Za-z0-9+/=]+$')
-ENHANCE_ASSET_VERSION = '20260312-speedup2'
+ENHANCE_ASSET_VERSION = '20260512-v13'
+
+# ── Teacher token management ──────────────────────────────────────────────
+TEACHER_PHONE = os.environ.get('TEACHER_PHONE', '13900000001')
+TEACHER_PASSWORD = os.environ.get('TEACHER_PASSWORD', '1234567890')
+_teacher_token = None
+_teacher_token_lock = threading.Lock()
+_teacher_session = None
+_teacher_session_lock = threading.Lock()
+
+
+def _get_teacher_session():
+    """Return a persistent requests.Session logged in as the teacher."""
+    global _teacher_session
+    with _teacher_session_lock:
+        if _teacher_session is not None:
+            return _teacher_session
+        session = requests.Session()
+        session.trust_env = False
+        session.verify = False
+        try:
+            resp = session.post(
+                f'{TARGET_URL}/exam/login/api/signin',
+                json={'phoneNumber': TEACHER_PHONE, 'pwd': TEACHER_PASSWORD},
+                headers={'Content-Type': 'application/json'},
+                timeout=REQUEST_TIMEOUT,
+            )
+            resp.close()
+        except Exception:
+            pass
+        _teacher_session = session
+        return session
+
+
+def _get_teacher_token():
+    """Obtain (and cache) a valid teacher token. Re-logins if needed."""
+    global _teacher_token
+    with _teacher_token_lock:
+        if _teacher_token:
+            return _teacher_token
+        session = _get_teacher_session()
+        try:
+            resp = session.post(
+                f'{TARGET_URL}/exam/login/api/signin',
+                json={'phoneNumber': TEACHER_PHONE, 'pwd': TEACHER_PASSWORD},
+                headers={'Content-Type': 'application/json'},
+                timeout=REQUEST_TIMEOUT,
+            )
+            # Get token from cookies
+            for cookie in resp.cookies:
+                if cookie.name == 'token' and cookie.value:
+                    _teacher_token = cookie.value
+                    break
+            # Also update session cookies
+            if _teacher_token:
+                session.cookies.set('token', _teacher_token)
+            resp.close()
+        except Exception as exc:
+            app.logger.warning('Teacher login failed: %s', exc)
+        return _teacher_token or ''
+
+
+def _teacher_api_request(method, url, **kwargs):
+    """Make an API call to upstream using the teacher token. Auto-refreshes on 401."""
+    token = _get_teacher_token()
+    if not token:
+        raise RuntimeError('Teacher token unavailable')
+    cookies = kwargs.pop('cookies', {})
+    if isinstance(cookies, dict):
+        cookies = dict(cookies)
+        cookies.setdefault('token', token)
+    else:
+        cookies = {'token': token}
+    kwargs['cookies'] = cookies
+    kwargs.setdefault('verify', False)
+    kwargs.setdefault('timeout', REQUEST_TIMEOUT)
+    kwargs.setdefault('allow_redirects', False)
+
+    session = _get_teacher_session()
+    resp = session.request(method=method, url=url, **kwargs)
+
+    # If unauthorized, re-login and retry once
+    if resp.status_code == 401 or (resp.headers.get('Content-Type', '').startswith('application/json') and _try_parse_json(resp).get('code') == 10003):
+        global _teacher_token
+        with _teacher_token_lock:
+            _teacher_token = None
+        new_token = _get_teacher_token()
+        if new_token and new_token != token:
+            if isinstance(cookies, dict):
+                cookies['token'] = new_token
+            kwargs['cookies'] = cookies
+            resp.close()
+            resp = session.request(method=method, url=url, **kwargs)
+    return resp
+
+
+def _try_parse_json(resp):
+    try:
+        return resp.json()
+    except Exception:
+        return {}
+
+
+async def _async_teacher_request(url, headers=None):
+    """Make an async API call using teacher token. Returns parsed JSON or None."""
+    token = _get_teacher_token()
+    if not token:
+        return None
+    req_headers = dict(headers or {})
+    req_headers.setdefault('Accept', 'application/json, text/plain, */*')
+    cookies = {'token': token}
+    connector = aiohttp.TCPConnector(ssl=False)
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+    try:
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout, cookies=cookies) as session:
+            async with session.get(url, headers=req_headers) as resp:
+                raw = await resp.read()
+                record_proxy_traffic(download_bytes=len(raw))
+                return json.loads(raw.decode(resp.charset or 'utf-8'))
+    except Exception:
+        return None
+
+
+# ── Statistics computation helpers ────────────────────────────────────────
+import math as _math
+from collections import Counter as _Counter
+
+
+def _compute_descriptive_stats(values):
+    """Compute descriptive statistics for a list of numbers.
+    Returns dict with: count, mean, median, min, max, range, mode, q1, q3, iqr, skewness, kurtosis, variance, std.
+    """
+    if not values:
+        return {'count': 0, 'error': 'No data'}
+    n = len(values)
+    sorted_vals = sorted(values)
+    mean = sum(values) / n
+
+    # Median
+    if n % 2 == 1:
+        median = sorted_vals[n // 2]
+    else:
+        median = (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2.0
+
+    # Quartiles (using method similar to numpy's default)
+    def _quartile(data, q):
+        idx = q * (len(data) - 1)
+        lo = int(idx)
+        hi = min(lo + 1, len(data) - 1)
+        frac = idx - lo
+        return data[lo] * (1 - frac) + data[hi] * frac
+
+    q1 = _quartile(sorted_vals, 0.25)
+    q3 = _quartile(sorted_vals, 0.75)
+    iqr = q3 - q1
+
+    # Mode
+    counter = _Counter(values)
+    max_count = max(counter.values())
+    if max_count == 1:
+        mode = None
+        mode_count = None
+    else:
+        mode = [k for k, v in counter.items() if v == max_count]
+        mode_count = max_count
+
+    # Variance (population)
+    variance = sum((x - mean) ** 2 for x in values) / n
+    std = _math.sqrt(variance)
+
+    # Skewness (adjusted Fisher-Pearson)
+    if std > 0 and n > 2:
+        m3 = sum((x - mean) ** 3 for x in values) / n
+        skewness = (m3 / (std ** 3)) * _math.sqrt(n * (n - 1)) / (n - 2)
+    else:
+        skewness = 0.0
+
+    # Excess Kurtosis
+    if std > 0 and n > 3:
+        m4 = sum((x - mean) ** 4 for x in values) / n
+        k_raw = m4 / (std ** 4)
+        kurtosis = ((n + 1) * (k_raw - 3) + 6) * (n - 1) / ((n - 2) * (n - 3))
+    else:
+        kurtosis = 0.0
+
+    return {
+        'count': n,
+        'mean': round(mean, 4),
+        'median': round(median, 4),
+        'min': round(sorted_vals[0], 4),
+        'max': round(sorted_vals[-1], 4),
+        'range': round(sorted_vals[-1] - sorted_vals[0], 4),
+        'mode': mode,
+        'modeCount': mode_count,
+        'q1': round(q1, 4),
+        'q3': round(q3, 4),
+        'iqr': round(iqr, 4),
+        'skewness': round(skewness, 4),
+        'kurtosis': round(kurtosis, 4),
+        'variance': round(variance, 4),
+        'std': round(std, 4),
+    }
+
+
+def _compute_score_distribution(scores, max_score=None, segments=20, non_empty=False):
+    """Return score distribution counts split into score-width segments."""
+    if not scores:
+        return {'segments': segments, 'distribution': [], 'labels': []}
+    usable_scores = [float(s) for s in scores]
+    if not usable_scores:
+        return {'segments': segments, 'distribution': [], 'labels': []}
+    low = 0.0
+    high = float(max_score) if max_score and max_score > 0 else max(usable_scores)
+    if high <= low:
+        high = max(usable_scores) or 1.0
+    width = high / float(max(1, segments))
+    counts = [0 for _ in range(segments)]
+    for score in usable_scores:
+        if score < 0:
+            continue
+        idx = int(score / width) if width > 0 else 0
+        if idx >= segments:
+            idx = segments - 1
+        counts[idx] += 1
+    labels = []
+    out_counts = []
+    for i, count in enumerate(counts):
+        start = i * width
+        end = high if i == segments - 1 else (i + 1) * width
+        if non_empty and count == 0:
+            continue
+        labels.append(f'{start:.1f}-{end:.1f}')
+        out_counts.append(count)
+    return {'segments': len(out_counts), 'distribution': out_counts, 'labels': labels}
+
+
+def _compute_cronbach_alpha(question_scores, question_max_scores):
+    """Compute standardized Cronbach's alpha.
+    question_scores: list of lists, each inner list is scores for one question across all students.
+    question_max_scores: list of max scores for each question.
+    Normalizes each question score by its max before computing alpha.
+    Returns alpha coefficient.
+    """
+    k = len(question_scores)
+    if k < 2:
+        return None
+    # Find students present in all questions - align by index
+    min_students = min(len(qs) for qs in question_scores)
+    if min_students < 2:
+        return None
+
+    # Normalize scores: for each question, divide by max_score
+    normalized = []
+    for i in range(k):
+        max_s = question_max_scores[i] if i < len(question_max_scores) and question_max_scores[i] > 0 else 1.0
+        normalized.append([(s / max_s) if max_s > 0 else 0 for s in question_scores[i][:min_students]])
+
+    # Compute item variances (using normalized scores)
+    item_variances = []
+    for i in range(k):
+        vals = normalized[i]
+        mean_i = sum(vals) / len(vals)
+        var_i = sum((v - mean_i) ** 2 for v in vals) / len(vals)
+        item_variances.append(var_i)
+
+    # Compute total score for each student, then total variance
+    totals = []
+    for j in range(min_students):
+        total = sum(normalized[i][j] for i in range(k))
+        totals.append(total)
+    total_variance = sum((t - sum(totals) / len(totals)) ** 2 for t in totals) / len(totals)
+
+    if total_variance == 0:
+        return 1.0  # All students have identical normalized scores
+
+    # Standardized alpha
+    alpha = (k / (k - 1.0)) * (1.0 - sum(item_variances) / total_variance)
+    return round(max(-1.0, min(1.0, alpha)), 6)
+
+
+def _compute_item_discrimination(question_scores, total_scores):
+    """Compute item discrimination index (point-biserial correlation equivalent).
+    Returns correlation between item score and total score (minus item).
+    """
+    if len(question_scores) != len(total_scores) or len(question_scores) < 2:
+        return None
+    n = len(question_scores)
+    # Total minus this item
+    totals_minus = [total_scores[i] - question_scores[i] for i in range(n)]
+
+    mean_q = sum(question_scores) / n
+    mean_t = sum(totals_minus) / n
+
+    cov = sum((question_scores[i] - mean_q) * (totals_minus[i] - mean_t) for i in range(n)) / n
+    std_q = _math.sqrt(sum((q - mean_q) ** 2 for q in question_scores) / n)
+    std_t = _math.sqrt(sum((t - mean_t) ** 2 for t in totals_minus) / n)
+
+    if std_q == 0 or std_t == 0:
+        return 0.0
+    return round(cov / (std_q * std_t), 6)
+
+
+def _compute_alpha_without_item(question_scores, question_max_scores, remove_idx):
+    """Compute Cronbach's alpha after removing one item."""
+    if remove_idx < 0 or remove_idx >= len(question_scores):
+        return _compute_cronbach_alpha(question_scores, question_max_scores)
+    new_scores = [s for i, s in enumerate(question_scores) if i != remove_idx]
+    new_max = [m for i, m in enumerate(question_max_scores) if i != remove_idx]
+    return _compute_cronbach_alpha(new_scores, new_max)
+
+
+def _normalize_question_number(value):
+    text = str(value or '').strip()
+    if not text:
+        return None
+    try:
+        return int(float(text))
+    except (TypeError, ValueError):
+        match = re.search(r'\d+', text)
+        return int(match.group(0)) if match else None
+
+
+def _normalize_question_label(value):
+    text = str(value or '').strip()
+    if not text or '作答' in text:
+        return None
+    return text if re.match(r'^\d+', text) else None
+
+
+def _question_label_sort_key(value):
+    text = str(value or '')
+    values = [int(part) for part in re.findall(r'\d+', text)]
+    return tuple(values) if values else (10 ** 9,)
+
+
+def _question_label_matches_parent(label, parent_label):
+    label = str(label or '')
+    parent_label = str(parent_label or '')
+    if not label or not parent_label or label == parent_label:
+        return False
+    return label.startswith(parent_label + '-') or label.startswith(parent_label + '（') or label.startswith(parent_label + '(')
+
+
+def _download_teacher_export(*candidate_ids):
+    """Download the Excel export, trying catalogId/paperId candidates in order."""
+    last_error = ''
+    seen = set()
+    for candidate_id in candidate_ids:
+        if not candidate_id or candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        resp = None
+        try:
+            resp = _teacher_api_request(
+                'GET',
+                f'{TARGET_URL}/exam/api/paper/{candidate_id}/export',
+            )
+            content = resp.content
+            content_type = (resp.headers.get('Content-Type') or '').lower()
+            if resp.status_code < 400 and (content[:2] == b'PK' or 'spreadsheetml' in content_type):
+                return content, candidate_id
+            last_error = f'{candidate_id}: HTTP {resp.status_code}'
+        except Exception as exc:
+            last_error = f'{candidate_id}: {exc}'
+        finally:
+            if resp is not None:
+                resp.close()
+    raise RuntimeError(last_error or 'Excel export unavailable')
+
+
+def _flatten_paper_questions(items):
+    for item in items or []:
+        question = item.get('content') if isinstance(item, dict) and isinstance(item.get('content'), dict) else item
+        if not isinstance(question, dict):
+            continue
+        yield question
+        child_list = question.get('childList') or question.get('children') or []
+        if isinstance(child_list, list):
+            yield from _flatten_paper_questions(child_list)
+
+
+def _get_paper_question_meta(paper_id):
+    """Return question metadata keyed by real id and Excel question number."""
+    by_id = {}
+    by_number = {}
+    resp = None
+    try:
+        resp = _teacher_api_request('GET', f'{TARGET_URL}/exam/api/paper/content/{paper_id}')
+        payload = resp.json()
+        for question in _flatten_paper_questions(payload.get('extra') or []):
+            qid = question.get('id') or question.get('questionId')
+            raw_number = question.get('questionNumber') or question.get('number') or qid
+            qlabel = _normalize_question_label(raw_number)
+            qnum = _normalize_question_number(raw_number)
+            score_max = _safe_float(
+                question.get('questionScore')
+                or question.get('score')
+                or question.get('scoreMax')
+                or question.get('fullScore')
+            )
+            meta = {
+                'id': qid,
+                'questionNumber': qlabel or qnum,
+                'scoreMax': score_max if score_max > 0 else 1.0,
+            }
+            if qid is not None:
+                by_id[int(qid)] = meta
+            if qlabel is not None:
+                by_number.setdefault(qlabel, meta)
+            if qnum is not None:
+                by_number.setdefault(qnum, meta)
+    except Exception as exc:
+        app.logger.warning('Failed to load paper question metadata for %s: %s', paper_id, exc)
+    finally:
+        if resp is not None:
+            resp.close()
+    return by_id, by_number
+
+
+def _extract_catalog_id_from_request():
+    catalog_id = request.args.get('catalogId', type=int)
+    if catalog_id:
+        return catalog_id
+    ref = request.headers.get('Referer') or ''
+    try:
+        parsed = parse.urlparse(ref)
+        query = parsed.fragment.split('?', 1)[1] if '?' in parsed.fragment else parsed.query
+        return int(parse.parse_qs(query).get('catalogId', [''])[0])
+    except Exception:
+        return None
+
+
+def _get_teacher_student_scores(entity_id, paper_id=None):
+    """Return published class scores from the teacher statistics API."""
+    query_paper_id = paper_id or entity_id
+    resp = None
+    try:
+        resp = _teacher_api_request(
+            'GET',
+            f'{TARGET_URL}/exam/api/paper/statistics/entity/{entity_id}/student?paperId={query_paper_id}',
+        )
+        payload = resp.json()
+        if payload.get('code') != 0:
+            return None
+        extra = payload.get('extra') or {}
+        records = extra.get('students') or extra.get('records') or extra.get('list') or []
+        scores = []
+        students = []
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            score = _safe_float(rec.get('scoring') or rec.get('stuScore') or rec.get('totalScore'))
+            students.append({
+                'id': str(rec.get('id') or rec.get('stuId') or rec.get('studentId') or ''),
+                'name': str(rec.get('userName') or rec.get('stuName') or rec.get('name') or ''),
+                'score': score,
+            })
+            scores.append(score)
+        non_zero_students = [s for s in students if s['score'] > 0]
+        return {
+            'scoreTotal': _safe_float(extra.get('scoringTotal') or extra.get('scoreTotal')),
+            'scoreAverage': _safe_float(extra.get('scoringAverage') or extra.get('scoringScoreAvg')),
+            'totalCount': len(students),
+            'filteredCount': len(students) - len(non_zero_students),
+            'students': non_zero_students or students,
+            'scores': [s['score'] for s in (non_zero_students or students)],
+        }
+    except Exception as exc:
+        app.logger.warning('Teacher student score statistics failed for %s/%s: %s', entity_id, paper_id, exc)
+        return None
+    finally:
+        if resp is not None:
+            resp.close()
+
+
+def _get_student_own_score(paper_id, cookies, headers=None):
+    """Read the current student's own published score from the student endpoint."""
+    if not cookies:
+        return None
+    resp = None
+    try:
+        resp = requests.get(
+            f'{TARGET_URL}/exam/api/student/paper/entity/{paper_id}/statistics',
+            headers=headers or get_request_headers({'host'}),
+            cookies=cookies,
+            verify=False,
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=False,
+        )
+        payload = resp.json()
+        if payload.get('code') != 0:
+            return None
+        extra = payload.get('extra') or {}
+        score = _safe_float(extra.get('scoring'))
+        total = _safe_float(extra.get('scoringTotal'))
+        return {'score': score, 'total': total}
+    except Exception as exc:
+        app.logger.warning('Student own score lookup failed for %s: %s', paper_id, exc)
+        return None
+    finally:
+        if resp is not None:
+            resp.close()
 
 DEFAULT_CJK_SANS_FONT_STACK = (
     '"Noto Sans CJK SC", "Noto Sans SC", "Source Han Sans SC", '
@@ -844,6 +1356,9 @@ def get_pdfkit_config():
         return PDFKIT_CONFIG
 
     PDFKIT_READY = True
+    if pdfkit is None:
+        app.logger.warning('pdfkit is not installed')
+        return None
     try:
         PDFKIT_CONFIG = pdfkit.configuration(wkhtmltopdf=WKHTMLTOPDF_BIN)
     except Exception as exc:
@@ -2118,7 +2633,9 @@ def get_course(id):
         )
         data = resp.json()
         for i in data["extra"]:
-            i["courseName"] = re.sub(r'^.+闂�?- (闂傚倷绀侀幉锟犲箹閳哄懎鍨傞柛妤冨剳閼�?)*', '', i["courseName"])
+            # Clean up any prefix in course name (e.g., "teacher_name - ")
+            raw_name = i.get("courseName", "") or ""
+            i["courseName"] = re.sub(r'^[^-]+-\s*', '', raw_name.strip())
         response = Response(json.dumps(data), resp.status_code, headers)
         return set_requests_cookies(response, resp)
     finally:
@@ -2196,7 +2713,8 @@ def get_exam(catalog_id):
         )
         data = resp.json()
         for i in data["extra"]:
-            i["paperName"] = re.sub(r'^.+闂�?- (闂傚倷绀侀幉锟犲箹閳哄懎鍨傞柛妤冨剳閼�?)*', '', i["paperName"])
+            # Don't strip paper name - keep it as-is from upstream
+            pass
             if (1 or i["paperFinishTag"] == 1):
                 i["openAnswer"] = 1
                 i["openScore"] = 1
@@ -2268,61 +2786,78 @@ async def get_statistics(entity_id):
         if data["code"] == 10001:
             data["code"] = 0
             data["message"] = "SUCCESS"
+
+            # ── Try to fetch real max/avg from teacher API ──────────────
+            real_max = ""
+            real_avg = ""
+            try:
+                # Use the teacher token to get class-wide statistics
+                teacher_stats = await _async_teacher_request(
+                    f'{TARGET_URL}/exam/api/paper/statistics/entity/{entity_id}/student?paperId={entity_id}',
+                    headers=req_headers
+                )
+                if teacher_stats and teacher_stats.get('code') in (0, None):
+                    records = teacher_stats.get('extra') or teacher_stats.get('data') or []
+                    if isinstance(records, dict):
+                        records = records.get('records') or records.get('list') or []
+                    if records and len(records) > 0:
+                        all_scores = []
+                        for rec in records:
+                            if isinstance(rec, dict):
+                                sc = _safe_float(rec.get('stuScore') or rec.get('totalScore') or 0)
+                                all_scores.append(sc)
+                        # Filter out all-zero students
+                        non_zero = [s for s in all_scores if s > 0]
+                        if non_zero:
+                            real_max = f"{max(non_zero):.1f}"
+                            real_avg = f"{sum(non_zero) / len(non_zero):.1f}"
+                        elif all_scores:
+                            real_max = f"{max(all_scores):.1f}"
+                            real_avg = f"{sum(all_scores) / len(all_scores):.1f}"
+            except Exception:
+                pass  # Fall back to placeholder if teacher API is unavailable
+
+            if not real_max or not real_avg:
+                try:
+                    catalog_id = _extract_catalog_id_from_request()
+                    excel_bytes, _ = _download_teacher_export(catalog_id, entity_id)
+                    wb = openpyxl.load_workbook(io.BytesIO(excel_bytes), data_only=True)
+                    ws = wb[wb.sheetnames[0]]
+                    rows = list(ws.iter_rows(min_row=1, values_only=True))
+                    headers = [str(h or '').strip() for h in rows[0]] if rows else []
+                    col_total = -1
+                    for idx, h in enumerate(headers):
+                        hl = h.lower()
+                        if hl in ('总分', '总分(原始)', '总分(折合)', '总', 'total', 'score', 'scoring') or '总' in h:
+                            col_total = idx
+                            break
+                    if col_total >= 0:
+                        scores = []
+                        for row in rows[1:]:
+                            if col_total < len(row):
+                                score_value = _safe_float(row[col_total])
+                                if score_value > 0:
+                                    scores.append(score_value)
+                        if scores:
+                            real_max = f"{max(scores):.1f}"
+                            real_avg = f"{sum(scores) / len(scores):.1f}"
+                except Exception as exc:
+                    app.logger.warning('Excel fallback for unpublished stats failed: %s', exc)
+
             data["extra"] = {
                 "scoring": "",
                 "scoringTotal": "",
-                "scoringScoreMax": "114.514",
-                "scoringScoreAvg": "1919.810",
+                "scoringScoreMax": real_max or "暂无",
+                "scoringScoreAvg": real_avg or "暂无",
                 "paperBeginTime": None,
                 "paperEndTime": None,
                 "studentLibs": [],
                 "studentPaperQuestions": [],
                 "pointDTOList": [],
-                "scoreRangeStudentCountsList": [None, None, None, None],
+                "scoreRangeStudentCountsList": [],
                 "paperStudentScoreList": [],
                 "paperCommentingTag": False
             }
-
-            content, question = await asyncio.gather(
-                get(session, f'{TARGET_URL}/exam/api/student/paper/entity/{entity_id}/content', headers=req_headers),
-                get(session, f'{TARGET_URL}/exam/api/student/paper/entity/{entity_id}/question', headers=req_headers)
-            )
-
-            content = content["extra"]
-            question = question["extra"]
-            question = {i["questionId"]: i for i in question}
-
-            score = 0
-            err = 0
-            for i in content:
-                if i["contentType"] == 2:
-                    try:
-                        i["content"]["studentScore"] = question[i["content"]["id"]]["studentScore"]
-                    except KeyError:
-                        err = 1
-
-                    try:
-                        if len(i["content"]["childList"]) > 1:
-                            for j in range(len(i["content"]["childList"])):
-                                i["content"]["childList"][j]["studentSubmitTime"] = \
-                                    question[i["content"]["childList"][j]["id"]]["studentSubmitTime"]
-                                score += question[i["content"]["childList"][j]["id"]]["studentScore"]
-                        else:
-                            i["content"]["studentSubmitTime"] = question[i["content"]["id"]]["studentSubmitTime"]
-                            score += question[i["content"]["id"]]["studentScore"]
-                    except Exception:
-                        pass
-
-                    data["extra"]["studentPaperQuestions"].append(i["content"])
-
-            if err == 1:
-                score = 0
-                for qid in question:
-                    if question[qid]["studentScore"] is not None:
-                        score += question[qid]["studentScore"]
-                score = str(score) + " estimated"
-
-            data["extra"]["scoring"] = str(score) + " (unpublished)"
 
     response = Response(json.dumps(data), status_code, headers)
     return set_aiohttp_cookies(response, resp_cookie_holder)
@@ -2451,6 +2986,457 @@ def proxy_question_extra_attachment(tp, entity_id, question_id, attachment_id):
     return _proxy_attachment_api(tp, entity_id, question_id, attachment_id, extra_segment='extra')
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Enhanced exam endpoints (teacher-token-based)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.route('/exam/api/paper/list/<int:catalog_id>')
+def proxy_paper_list(catalog_id):
+    """Proxy the teacher paper-list endpoint (works with student token too)."""
+    resp = upstream_request(
+        method='GET',
+        url=f'{TARGET_URL}/exam/api/paper/list/{catalog_id}',
+        headers=get_request_headers({'host'}),
+        cookies=request.cookies,
+        allow_redirects=False,
+        timeout=REQUEST_TIMEOUT,
+    )
+    try:
+        data = resp.json()
+        headers = filter_upstream_headers(
+            resp.raw.headers,
+            excluded=['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+        )
+        response = Response(json.dumps(data), resp.status_code, headers)
+        return set_requests_cookies(response, resp)
+    finally:
+        resp.close()
+
+
+@app.route('/exam/api/paper/<int:catalog_id>/export')
+def proxy_paper_export(catalog_id):
+    return jsonify({'code': 403, 'message': '成绩明细Excel包含学生身份信息，前端不提供下载。'}), 403
+
+
+@app.route('/exam/api/paper/content/<int:paper_id>')
+def proxy_paper_content_teacher(paper_id):
+    """Fetch paper content (including answers) using the teacher token."""
+    try:
+        resp = _teacher_api_request(
+            'GET',
+            f'{TARGET_URL}/exam/api/paper/content/{paper_id}',
+        )
+    except Exception as exc:
+        return jsonify({'code': -1, 'message': f'获取答案失败: {exc}'}), 502
+
+    try:
+        data = resp.json()
+        headers = filter_upstream_headers(
+            resp.raw.headers,
+            excluded=['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+        )
+        return Response(json.dumps(data), resp.status_code, headers)
+    finally:
+        resp.close()
+
+
+@app.route('/exam/api/enhanced/statistics/<int:paper_id>')
+async def enhanced_statistics(paper_id):
+    """Compute comprehensive exam statistics via Excel download.
+    Uses teacher token to download the class Excel, then parses it for all data.
+    Uses paperId (not catalogId) for the Excel download to get correct data.
+    """
+    catalog_id = _extract_catalog_id_from_request()
+    if not catalog_id:
+        catalog_id = paper_id
+
+    # 1. Download Excel with teacher token. Some upstream installs expect
+    # catalogId here, while paper content expects paperId, so try both.
+    try:
+        excel_bytes, export_id = _download_teacher_export(paper_id, catalog_id)
+    except Exception as exc:
+        return jsonify({'code': -1, 'message': f'下载Excel失败: {exc}'}), 502
+
+    # 2. Parse Excel
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(excel_bytes))
+        ws = wb[wb.sheetnames[0]]
+    except Exception as exc:
+        return jsonify({'code': -1, 'message': f'解析Excel失败: {exc}'}), 502
+
+    # 3. Extract headers
+    rows = list(ws.iter_rows(min_row=1, values_only=True))
+    if len(rows) < 2:
+        return jsonify({'code': -1, 'message': 'Excel数据不足'}), 502
+
+    headers = [str(h or '').strip() for h in rows[0]]
+    # Find column indices
+    col_student_id = col_student_name = col_total = -1
+    question_cols = []  # list of (col_idx, question_number)
+
+    for idx, h in enumerate(headers):
+        hl = h.lower()
+        if hl in ('学号', 'studentid', 'studentno', 'stu_id', 'userid'):
+            col_student_id = idx
+        elif hl in ('姓名', 'name', 'username', 'studentname', 'student'):
+            col_student_name = idx
+        elif hl in ('总分', '总分(原始)', '总分(折合)', '总', 'total', 'score', 'scoring'):
+            col_total = idx
+        else:
+            # Check if it's a question number (digits)
+            qlabel = _normalize_question_label(h)
+            if qlabel:
+                question_cols.append((idx, qlabel))
+
+    # Fallback: if no 总分 found, look for common patterns
+    if col_total < 0:
+        for idx, h in enumerate(headers):
+            if '总' in h or 'total' in h.lower() or 'score' in h.lower():
+                col_total = idx
+                break
+
+    # 4. Parse student data rows
+    students = []
+    for row in rows[1:]:
+        if not row or all(v is None or str(v).strip() == '' for v in row):
+            continue
+        sid = str(row[col_student_id] or '') if col_student_id >= 0 else ''
+        sname = str(row[col_student_name] or '') if col_student_name >= 0 else sid
+        total = _safe_float(row[col_total]) if col_total >= 0 else 0
+
+        # Per-question scores
+        q_scores = {}
+        for col_idx, qnum in question_cols:
+            if col_idx < len(row):
+                q_scores[qnum] = _safe_float(row[col_idx])
+        # Also compute total from question scores if total col missing
+        if col_total < 0 and q_scores:
+            total = sum(q_scores.values())
+
+        students.append({
+            'id': sid,
+            'name': sname,
+            'totalScore': total,
+            'questionScores': q_scores,
+        })
+
+    if not students:
+        return jsonify({'code': 0, 'extra': {'message': '没有学生数据', 'studentCount': 0}})
+
+    # 5. Filter out all-zero students
+    valid_students = [s for s in students if s['totalScore'] > 0 or any(v > 0 for v in s['questionScores'].values())]
+    if not valid_students:
+        valid_students = students  # keep all if all are zero
+
+    excel_student_scores = [s['totalScore'] for s in valid_students]
+    teacher_score_payload = _get_teacher_student_scores(paper_id, paper_id) or _get_teacher_student_scores(catalog_id, paper_id)
+    if teacher_score_payload and teacher_score_payload.get('scores'):
+        student_scores = teacher_score_payload['scores']
+        score_total = teacher_score_payload.get('scoreTotal') or max(student_scores)
+        score_students = teacher_score_payload.get('students') or []
+        score_student_count = len(student_scores)
+        total_student_count = teacher_score_payload.get('totalCount') or len(student_scores)
+        filtered_student_count = teacher_score_payload.get('filteredCount') or 0
+    else:
+        student_scores = excel_student_scores
+        score_total = None
+        score_students = []
+        score_student_count = len(valid_students)
+        total_student_count = len(students)
+        filtered_student_count = len(students) - len(valid_students)
+
+    # 6. Build question info from Excel headers
+    _, question_meta_by_number = _get_paper_question_meta(paper_id)
+    question_numbers = [qnum for _, qnum in sorted(question_cols, key=lambda x: _question_label_sort_key(x[1]))]
+    questions = []
+    question_max_scores = []
+    question_student_scores = []
+
+    for qnum in question_numbers:
+        q_scores_list = [s['questionScores'].get(qnum, 0) for s in valid_students]
+        meta = question_meta_by_number.get(qnum) or question_meta_by_number.get(_normalize_question_number(qnum)) or {}
+        q_max = _safe_float(meta.get('scoreMax')) or (max(q_scores_list) if q_scores_list else 1.0)
+        if q_max < 0.5:
+            q_max = 1.0
+        questions.append({
+            'id': meta.get('id') or qnum,
+            'questionNumber': str(qnum),
+            'scoreMax': q_max,
+            'questionStem': '',
+        })
+        question_max_scores.append(q_max)
+        question_student_scores.append(q_scores_list)
+
+    if not score_total:
+        score_total = sum(question_max_scores) if question_max_scores else (max(student_scores) if student_scores else 0)
+
+    # 7. Compute overall statistics
+    overall_stats = _compute_descriptive_stats(student_scores)
+
+    # 8. Score distribution
+    dist = _compute_score_distribution(student_scores, max_score=score_total, segments=20)
+
+    # 9. Cronbach's alpha
+    alpha = _compute_cronbach_alpha(question_student_scores, question_max_scores)
+
+    # 10. Item discrimination
+    item_discriminations = []
+    for qi, q in enumerate(questions):
+        disc = _compute_item_discrimination(
+            question_student_scores[qi],
+            excel_student_scores
+        )
+        item_discriminations.append({
+            'questionId': q['id'],
+            'questionNumber': q['questionNumber'],
+            'discrimination': disc,
+        })
+    valid_discriminations = [
+        item['discrimination']
+        for item in item_discriminations
+        if item.get('discrimination') is not None
+    ]
+    paper_discrimination = (
+        round(sum(valid_discriminations) / len(valid_discriminations), 6)
+        if valid_discriminations else None
+    )
+
+    # 11. All scores (anonymized, sorted)
+    all_scores_sorted = sorted(student_scores, reverse=True)
+    score_list = [{'rank': i + 1, 'score': round(s, 2)} for i, s in enumerate(all_scores_sorted)]
+
+    # 12. Find current student's rank if student token is available
+    student_rank = None
+    student_total = None
+    own_score = _get_student_own_score(paper_id, dict(request.cookies), headers=get_request_headers({'host'}))
+    if own_score and own_score.get('score') is not None:
+        student_total = own_score.get('score')
+        if own_score.get('total'):
+            score_total = own_score.get('total')
+        sorted_scores_for_rank = sorted(student_scores, reverse=True)
+        student_rank = sum(1 for value in sorted_scores_for_rank if value > student_total) + 1 if sorted_scores_for_rank else None
+
+    student_key = str(request.args.get('studentKey') or request.args.get('studentId') or '').strip()
+    student_name = str(request.args.get('studentName') or '').strip()
+    if student_total is None and (student_key or student_name):
+        candidates = score_students or [
+            {'id': s.get('id'), 'name': s.get('name'), 'score': s.get('totalScore')}
+            for s in valid_students
+        ]
+        for s in candidates:
+            if (student_key and student_key in {str(s.get('id') or '').strip(), str(s.get('name') or '').strip()}) or (
+                student_name and student_name == str(s.get('name') or '').strip()
+            ):
+                student_total = s['score']
+                sorted_scores = sorted(student_scores, reverse=True)
+                student_rank = sorted_scores.index(student_total) + 1 if student_total in sorted_scores else None
+                break
+
+    return jsonify({
+        'code': 0,
+        'extra': {
+            'studentCount': score_student_count,
+            'totalStudentCount': total_student_count,
+            'filteredCount': filtered_student_count,
+            'questionCount': len(questions),
+            'questions': questions,
+            'overall': overall_stats,
+            'scoreDistribution': dist,
+            'cronbachAlpha': alpha,
+            'paperDiscrimination': paper_discrimination,
+            'itemDiscriminations': item_discriminations,
+            'allScores': score_list,
+            'studentRank': student_rank,
+            'studentTotal': student_total,
+            'scoreTotal': score_total,
+            'exportId': export_id,
+            'studentScores': [{'id': '', 'name': '', 'score': round(s, 2)} for s in sorted(student_scores, reverse=True)],
+        }
+    })
+
+
+def _try_get_student_score_from_cookies(token, students):
+    """Helper to find the current student's score from the list."""
+    # This is a placeholder - we'd need the student's own ID
+    return None
+
+
+@app.route('/exam/api/enhanced/statistics/<int:paper_id>/question/<int:question_id>')
+async def enhanced_question_statistics(paper_id, question_id):
+    """Compute per-question statistics via Excel download."""
+    catalog_id = _extract_catalog_id_from_request()
+    if not catalog_id:
+        catalog_id = paper_id
+
+    question_number_param = _normalize_question_label(request.args.get('questionNumber'))
+
+    # 1. Download Excel with teacher token. Try catalogId first because the
+    # upstream export endpoint is catalog-based on this deployment.
+    try:
+        excel_bytes, export_id = _download_teacher_export(paper_id, catalog_id)
+    except Exception as exc:
+        return jsonify({'code': -1, 'message': f'下载Excel失败: {exc}'}), 502
+
+    # 2. Parse Excel
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(excel_bytes))
+        ws = wb[wb.sheetnames[0]]
+    except Exception as exc:
+        return jsonify({'code': -1, 'message': f'解析Excel失败: {exc}'}), 502
+
+    rows = list(ws.iter_rows(min_row=1, values_only=True))
+    if len(rows) < 2:
+        return jsonify({'code': -1, 'message': 'Excel数据不足'}), 502
+
+    headers = [str(h or '').strip() for h in rows[0]]
+    col_student_id = col_student_name = col_total = -1
+    question_cols = []
+
+    for idx, h in enumerate(headers):
+        hl = h.lower()
+        if hl in ('学号', 'studentid', 'studentno'):
+            col_student_id = idx
+        elif hl in ('姓名', 'name', 'username', 'studentname'):
+            col_student_name = idx
+        elif hl in ('总分', '总', 'total', 'score'):
+            col_total = idx
+        else:
+            try:
+                qlabel = _normalize_question_label(h)
+                if qlabel:
+                    question_cols.append((idx, qlabel))
+            except (ValueError, TypeError):
+                pass
+
+    if col_total < 0:
+        for idx, h in enumerate(headers):
+            if '总' in h or 'total' in h.lower():
+                col_total = idx
+                break
+
+    # 3. Parse students
+    students = []
+    for row in rows[1:]:
+        if not row or all(v is None or str(v).strip() == '' for v in row):
+            continue
+        sid = str(row[col_student_id] or '') if col_student_id >= 0 else ''
+        total = _safe_float(row[col_total]) if col_total >= 0 else 0
+        q_scores = {}
+        for col_idx, qnum in question_cols:
+            if col_idx < len(row):
+                q_scores[qnum] = _safe_float(row[col_idx])
+        if col_total < 0 and q_scores:
+            total = sum(q_scores.values())
+        students.append({'id': sid, 'totalScore': total, 'questionScores': q_scores})
+
+    # 4. Filter zero students
+    valid_students = [s for s in students if s['totalScore'] > 0 or any(v > 0 for v in s['questionScores'].values())]
+    if not valid_students:
+        valid_students = students
+
+    question_meta_by_id, question_meta_by_number = _get_paper_question_meta(paper_id)
+    selected_question_number = question_number_param
+    if selected_question_number is None:
+        selected_question_number = (question_meta_by_id.get(question_id) or {}).get('questionNumber')
+    if selected_question_number is not None:
+        selected_question_number = str(selected_question_number)
+    if selected_question_number is None and str(question_id) in {str(qnum) for _, qnum in question_cols}:
+        selected_question_number = str(question_id)
+    if selected_question_number is None:
+        return jsonify({'code': -1, 'message': '无法定位该题在Excel中的题号'}), 404
+
+    # 5. Find this question's scores
+    available_labels = [qnum for _, qnum in question_cols]
+    if selected_question_number in available_labels:
+        selected_labels = [selected_question_number]
+    else:
+        selected_labels = [
+            label for label in available_labels
+            if _question_label_matches_parent(label, selected_question_number)
+        ]
+    if not selected_labels:
+        return jsonify({'code': -1, 'message': f'Excel中找不到题号 {selected_question_number}'}), 404
+
+    q_scores_list = [
+        sum(s['questionScores'].get(label, 0) for label in selected_labels)
+        for s in valid_students
+    ]
+    total_scores_list = [s['totalScore'] for s in valid_students]
+
+    # Max score for this question
+    selected_meta = question_meta_by_number.get(selected_question_number) or question_meta_by_id.get(question_id) or {}
+    if len(selected_labels) > 1:
+        q_max = sum(
+            _safe_float((question_meta_by_number.get(label) or {}).get('scoreMax'))
+            for label in selected_labels
+        )
+    else:
+        q_max = _safe_float(selected_meta.get('scoreMax')) or (max(q_scores_list) if q_scores_list else 1.0)
+    if q_max < 0.5:
+        q_max = 1.0
+
+    # Stats for this question
+    q_stats = _compute_descriptive_stats(q_scores_list)
+    non_zero_scores = [s for s in q_scores_list if s > 0]
+    non_zero_dist = (
+        _compute_score_distribution(non_zero_scores, max_score=q_max, segments=20, non_empty=True)
+        if non_zero_scores
+        else _compute_score_distribution(q_scores_list, max_score=q_max, segments=20, non_empty=True)
+    )
+
+    # Discrimination
+    discrimination = _compute_item_discrimination(q_scores_list, total_scores_list)
+
+    # Build all question score matrix for alpha computation
+    question_numbers = sorted(set(qnum for _, qnum in question_cols), key=_question_label_sort_key)
+    all_q_scores = []
+    all_q_max = []
+    for qnum in question_numbers:
+        scores_i = [s['questionScores'].get(qnum, 0) for s in valid_students]
+        meta_i = question_meta_by_number.get(qnum) or question_meta_by_number.get(_normalize_question_number(qnum)) or {}
+        max_i = _safe_float(meta_i.get('scoreMax')) or (max(scores_i) if scores_i else 1.0)
+        if max_i < 0.5:
+            max_i = 1.0
+        all_q_scores.append(scores_i)
+        all_q_max.append(max_i)
+
+    alpha_full = _compute_cronbach_alpha(all_q_scores, all_q_max)
+    q_idx = question_numbers.index(selected_labels[0]) if len(selected_labels) == 1 and selected_labels[0] in question_numbers else -1
+    alpha_without = _compute_alpha_without_item(all_q_scores, all_q_max, q_idx)
+
+    # All scores for this question
+    q_score_list = sorted(q_scores_list, reverse=True)
+    q_all_scores = [{'rank': i + 1, 'score': round(s, 2)} for i, s in enumerate(q_score_list)]
+
+    return jsonify({
+        'code': 0,
+        'extra': {
+            'questionId': question_id,
+            'questionNumber': str(selected_question_number),
+            'scoreColumns': selected_labels,
+            'scoreMax': q_max,
+            'studentCount': len(valid_students),
+            'stats': q_stats,
+            'discrimination': discrimination,
+            'scoreDistribution': non_zero_dist,
+            'allScores': q_all_scores,
+            'cronbachAlphaFull': alpha_full,
+            'cronbachAlphaWithout': alpha_without,
+            'exportId': export_id,
+        }
+    })
+
+
+def _safe_float(val):
+    """Safely convert a value to float."""
+    if val is None:
+        return 0.0
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
 def proxy(path):
@@ -2464,4 +3450,5 @@ def proxy(path):
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=29719, debug=False)
+    port = int(os.environ.get('PORT', '18080'))
+    app.run(host='0.0.0.0', port=port, debug=False)
